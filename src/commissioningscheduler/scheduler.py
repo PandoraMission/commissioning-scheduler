@@ -16,10 +16,9 @@ import copy
 import numpy as np
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict
 import xml.etree.ElementTree as ET
-from xml.dom import minidom
-from collections import defaultdict, Counter
+from collections import defaultdict
 
 from astropy import units as u
 from astropy.coordinates import SkyCoord
@@ -28,7 +27,8 @@ from pandoravisibility import Visibility
 
 # optional external pointing planner (user-provided file)
 try:
-    import pointing_planner as pp
+    # import .pointing_planner as pp
+    from .pointing_planner import *
     HAVE_POINTING_PLANNER = True
 except Exception:
     HAVE_POINTING_PLANNER = False
@@ -55,6 +55,7 @@ NS = {"cal": "/pandora/calendar/"}
 
 # def make_tag(name: str) -> str:
 #     return f"{{{NS}}}{name}"
+
 
 # -----------------------------
 # Data classes
@@ -95,22 +96,6 @@ def indent(elem, level: int = 0):
     elif level == 0:
         elem.tail = "\n"
 
-def write_pretty_xml(root: ET.Element, output_path: str):
-    """
-    Serialize an ElementTree root to a file with proper indentation
-    using minidom for formatting, while removing extra blank lines.
-    """
-    rough_string = ET.tostring(root, encoding="utf-8")
-    reparsed = minidom.parseString(rough_string)
-    pretty_xml = reparsed.toprettyxml(indent="    ", encoding="utf-8")
-
-    # Decode to string, strip extra blank lines, re-encode
-    pretty_str = pretty_xml.decode("utf-8")
-    pretty_str = "\n".join([line for line in pretty_str.splitlines() if line.strip()])
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(pretty_str)
-
 
 # -----------------------------
 # Visibility caching
@@ -118,6 +103,7 @@ def write_pretty_xml(root: ET.Element, output_path: str):
 def _vis_cache_key(ra: float, dec: float, tle1: str, tle2: str, key_extra: str = "") -> str:
     s = f"{ra}:{dec}:{tle1}:{tle2}:{key_extra}"
     return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
 
 def load_visibility_cache(ra: float, dec: float, tle1: str, tle2: str, key_extra: str = "") -> Optional[List[Tuple[datetime, datetime]]]:
     key = _vis_cache_key(ra, dec, tle1, tle2, key_extra)
@@ -130,11 +116,13 @@ def load_visibility_cache(ra: float, dec: float, tle1: str, tle2: str, key_extra
             return None
     return None
 
+
 def save_visibility_cache(ra: float, dec: float, tle1: str, tle2: str, windows: List[Tuple[datetime, datetime]], key_extra: str = ""):
     key = _vis_cache_key(ra, dec, tle1, tle2, key_extra)
     path = os.path.join(VIS_CACHE_DIR, key + '.pkl')
     with open(path, 'wb') as f:
         pickle.dump(windows, f)
+
 
 def compute_and_cache_visibility(ra: float, dec: float, start: datetime, end: datetime,
                                  tle1: str, tle2: str,
@@ -182,19 +170,6 @@ def compute_and_cache_visibility(ra: float, dec: float, start: datetime, end: da
         sliced.append((max(ws, start), min(we, end)))
     return sliced
 
-# -----------------------------
-# Helper: Find visibility window
-# -----------------------------
-def find_next_visibility_window(ra, dec, start_time, end_time, tle_data, min_duration_s=120):
-    """Find the next visibility window that meets minimum duration requirement"""
-    windows = compute_and_cache_visibility(ra, dec, start_time, end_time, 
-                                         tle_data[0], tle_data[1])
-    
-    for window_start, window_end in windows:
-        if (window_end - window_start).total_seconds() >= min_duration_s:
-            return (window_start, window_end)
-    
-    return None
 
 # -----------------------------
 # Helper: parse xml into ObservationSequence
@@ -229,6 +204,7 @@ def parse_task_xml(path: str) -> ObservationSequence:
     return ObservationSequence(filename=fn, visit_id=visit_id, obs_id=obs_id,
                                target=target, ra=ra, dec=dec,
                                xml_tree=tree, xml_root=root)
+
 
 # -----------------------------
 # Helper: compute durations from payload parameters
@@ -269,90 +245,6 @@ def compute_instrument_durations(obs: ObservationSequence) -> Tuple[float, float
 
     return nir_total_s, vda_total_s, nir_integration_s, vda_integration_s
 
-# -----------------------------
-# Helper: adjust payload for chunk
-# -----------------------------
-def adjust_payload_for_chunk(obs: ObservationSequence, chunk_seconds: int,
-                             nir_integr_s: float, vda_integr_s: float) -> ObservationSequence:
-    """
-    Modify the obs.xml_tree in-place to reflect the number of integrations/exposures
-    that fit in chunk_seconds. Does not touch sequence IDs.
-    """
-    # root = obs.xml_root
-    new_tree = ET.ElementTree(ET.fromstring(ET.tostring(obs.xml_root)))
-    new_root = new_tree.getroot()
-    obs_seq = new_root.find('.//cal:Observation_Sequence', namespaces=NS)
-
-    # NIRDA camera
-    nir = obs_seq.find('.//cal:AcquireInfCamImages', namespaces=NS)
-    if nir is not None and nir_integr_s > 0:
-        max_integrations = int(chunk_seconds // nir_integr_s)
-        if max_integrations < 1:
-            max_integrations = 1
-        nir.find('cal:SC_Integrations', namespaces=NS).text = str(max_integrations)
-
-    # VIS camera — AcquireVisCamImages
-    vda_img = obs_seq.find('.//cal:AcquireVisCamImages', namespaces=NS)
-    if vda_img is not None and vda_integr_s > 0:
-        max_exposures = int(chunk_seconds // vda_integr_s)
-        if max_exposures < 1:
-            max_exposures = 1
-        vda_img.find('cal:NumExposures', namespaces=NS).text = str(max_exposures)
-
-    # VIS camera — AcquireVisCamScienceData
-    vda_sci = obs_seq.find('.//cal:AcquireVisCamScienceData', namespaces=NS)
-    if vda_sci is not None and vda_integr_s > 0:
-        max_exposures = int(chunk_seconds // vda_integr_s)
-        if max_exposures < 1:
-            max_exposures = 1
-        vda_sci.find('cal:NumExposuresMax', namespaces=NS).text = str(max_exposures)
-
-    return ObservationSequence(
-        filename=obs.filename,
-        visit_id=obs.visit_id,
-        obs_id=obs.obs_id,
-        target=obs.target,
-        ra=obs.ra,
-        dec=obs.dec,
-        xml_tree=new_tree,
-        xml_root=new_root
-    )
-
-# -----------------------------
-# Helper: create visit element
-# -----------------------------
-def create_visit_element(obs, start_time, end_time, visit_id, obs_seq_id):
-    """Create a visit element for the XML with proper order of elements"""
-    visit = ET.Element('cal:Visit', namespace=NS)
-    ET.SubElement(visit, 'ID').text = f"{visit_id:04d}"
-
-    obs_seq = ET.SubElement(visit, 'Observation_Sequence')
-    ET.SubElement(obs_seq, 'ID').text = f"{obs_seq_id:03d}"
-
-    # Observational Parameters
-    obs_params = ET.SubElement(obs_seq, 'Observational_Parameters')
-    ET.SubElement(obs_params, 'Target').text = obs.target
-    ET.SubElement(obs_params, 'Priority').text = "1"
-    
-    # Timing MUST come before Boresight
-    timing = ET.SubElement(obs_params, 'Timing')
-    ET.SubElement(timing, 'Start').text = format_utc_time(start_time)
-    ET.SubElement(timing, 'Stop').text = format_utc_time(end_time)
-
-    # Boresight comes after Timing
-    boresight = ET.SubElement(obs_params, 'Boresight')
-    ET.SubElement(boresight, 'RA').text = str(obs.ra)
-    ET.SubElement(boresight, 'DEC').text = str(obs.dec)
-
-    # Copy Payload_Parameters from original XML
-    original_payload = obs.xml_root.find('.//cal:Payload_Parameters', namespaces=NS)
-    if original_payload is not None:
-        payload_params = ET.SubElement(obs_seq, 'Payload_Parameters')
-        # Copy all children from original payload
-        for child in original_payload:
-            payload_params.append(copy.deepcopy(child))
-
-    return visit
 
 # -----------------------------
 # Helper: update observation sequence
@@ -413,6 +305,7 @@ def update_observation_sequence(obs: ObservationSequence, duration_s: float) -> 
         xml_tree=new_tree,
         xml_root=new_root
     )
+
 
 def process_normal_task(obs: ObservationSequence, 
                        current_time: datetime, 
@@ -552,6 +445,7 @@ def process_normal_task(obs: ObservationSequence,
     
     return None
 
+
 # -----------------------------
 # Helper: make cardinal direction obs file
 # -----------------------------
@@ -588,6 +482,7 @@ def create_cardinal_observation(template_obs, ra, dec, cardinal_direction, targe
         xml_root=new_root
     )
 
+
 # -----------------------------
 # Helper: Align time to minute boundaries
 # -----------------------------
@@ -598,6 +493,7 @@ def align_to_minute_boundary(dt):
     if utc_dt.second == 0 and utc_dt.microsecond == 0:
         return utc_dt
     return utc_dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
+
 
 # -----------------------------
 # Helper: format UTC time
@@ -610,10 +506,12 @@ def ensure_utc_time(dt):
         return t.datetime
     return dt
 
+
 def format_utc_time(dt):
     """Format datetime to UTC string with Z suffix, ensuring UTC frame"""
     utc_dt = ensure_utc_time(dt)
     return utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
 
 # -----------------------------
 # Helper: create CVZ visit
@@ -650,6 +548,7 @@ def create_cvz_visit(cvz_ra: float, cvz_dec: float,
     
     return visit
 
+
 # -----------------------------
 # Helper: Make blank stare
 # -----------------------------
@@ -678,6 +577,7 @@ def modify_for_staring_only(obs: ObservationSequence) -> ObservationSequence:
         xml_root=new_root
     )
 
+
 # -----------------------------
 # Helper: CVZ visibility check
 # -----------------------------
@@ -694,6 +594,7 @@ def verify_cvz_visibility(cvz_ra, cvz_dec, start_time, end_time, tle_data):
         print(f"Warning: CVZ coordinates ({cvz_ra}, {cvz_dec}) only {visibility_fraction:.2%} visible")
     
     return visibility_fraction > 0.5  # Return True if more than 50% visible
+
 
 # -----------------------------
 # Helper: Split long observations
@@ -712,6 +613,7 @@ def split_long_observation_time(total_duration_s: float, max_duration_s: int = 5
         remaining -= segment
     
     return segments
+
 
 # -----------------------------
 # Helper: get schedulable observations
@@ -748,6 +650,7 @@ def get_schedulable_observations(obs_list: List[ObservationSequence],
             schedulable.append(obs)
     
     return schedulable
+
 
 # -----------------------------
 # Helper: handle task 0312
@@ -797,6 +700,7 @@ def create_task_0312_sequences(obs: ObservationSequence) -> List[Tuple[Observati
         is_data_collection = not is_data_collection
     
     return sequences
+
 
 def process_task_0312(obs: ObservationSequence, 
                      current_time: datetime, 
@@ -905,6 +809,7 @@ def process_task_0312(obs: ObservationSequence,
     
     return None
 
+
 # -----------------------------
 # Helper: handle tasks 0341 and 0342
 # -----------------------------
@@ -930,7 +835,8 @@ def process_cardinal_pointing_task(obs: ObservationSequence,
         return None
     
     try:
-        df = pp.load_ephemeris(pointing_ephem_file)
+        # df = pp.load_ephemeris(pointing_ephem_file)
+        df = load_ephemeris(pointing_ephem_file)
         cardinals = ["up", "ur", "right", "dr", "down", "dl", "left", "ul"]
         
         # Create new visit for this task
@@ -951,8 +857,10 @@ def process_cardinal_pointing_task(obs: ObservationSequence,
                     # If this is a retry, offset the time slightly to get a different pointing
                     pointing_time = current_time + timedelta(minutes=attempts-1) if attempts > 1 else current_time
                     
-                    pointing = pp.compute_pointing(df, pointing_time.strftime('%Y-%m-%d %H:%M:%S'), 
-                                                  target_body, cardinal, 15.0)
+                    # pointing = pp.compute_pointing(df, pointing_time.strftime('%Y-%m-%d %H:%M:%S'), 
+                    #                               target_body, cardinal, 15.0)
+                    pointing = compute_pointing(df, pointing_time.strftime('%Y-%m-%d %H:%M:%S'), 
+                                                target_body, cardinal, 15.0)
                     ra, dec = pointing.ra_deg, pointing.dec_deg
                     
                     # Create cardinal observation with proper target naming
@@ -1063,32 +971,6 @@ def process_cardinal_pointing_task(obs: ObservationSequence,
     
     return None
 
-# -----------------------------
-# Helper: estimate data volume
-# -----------------------------
-def estimate_data_volume_bytes(obs: ObservationSequence) -> int:
-    root = obs.xml_root
-    total_bytes = 0
-    nir = root.find('.//cal:AcquireInfCamImages', namespaces=NS)
-    if nir is not None:
-        ROI_SizeX = int(nir.findtext('cal:ROI_SizeX', '0', namespaces=NS))
-        ROI_SizeY = int(nir.findtext('cal:ROI_SizeY', '0', namespaces=NS))
-        SC_Integrations = int(nir.findtext('cal:SC_Integrations', '0', namespaces=NS))
-        frames = SC_Integrations
-        total_bytes += ROI_SizeX * ROI_SizeY * frames * BYTES_PER_PIXEL
-    vda = root.find('.//cal:AcquireVisCamImages', namespaces=NS)
-    vda_science = root.find('.//cal:AcquireVisCamScienceData', namespaces=NS)
-    if vda is not None:
-        NumExposures = int(vda.findtext('cal:NumExposures', '0', namespaces=NS))
-        ROI_SizeX = int(vda.findtext('cal:ROI_SizeX', '1024', namespaces=NS))
-        ROI_SizeY = int(vda.findtext('cal:ROI_SizeY', '1024', namespaces=NS))
-        total_bytes += (ROI_SizeX * ROI_SizeY * BYTES_PER_PIXEL + VIS_FRAME_OVERHEAD_BYTES) * NumExposures
-    elif vda_science is not None:
-        NumTotalFramesRequested = int(vda_science.findtext('cal:NumTotalFramesRequested', '0', namespaces=NS))
-        ROI_SizeX = int(vda_science.findtext('cal:ROI_SizeX', '1024', namespaces=NS))
-        ROI_SizeY = int(vda_science.findtext('cal:ROI_SizeY', '1024', namespaces=NS))
-        total_bytes += (ROI_SizeX * ROI_SizeY * BYTES_PER_PIXEL + VIS_FRAME_OVERHEAD_BYTES) * NumTotalFramesRequested
-    return int(total_bytes)
 
 # -----------------------------
 # File gatherer
@@ -1100,48 +982,6 @@ def gather_task_xmls(xml_dir: str) -> List[str]:
         return (int(m.group(1)), int(m.group(2))) if m else (9999, 999)
     return [os.path.join(xml_dir, f) for f in sorted(files, key=key)]
 
-# -----------------------------
-# Task dependency / ordering utilities
-# -----------------------------
-
-def load_dependencies(dep_file: Optional[str]) -> Dict[str, List[str]]:
-    """Load JSON mapping task numbers (as strings) to list of prerequisite tasks."""
-    if not dep_file:
-        return {}
-    with open(dep_file, 'r') as f:
-        return json.load(f)
-
-# -----------------------------
-# Determine dependency bottlenecks
-# -----------------------------
-def calculate_dependency_bottlenecks(obs_list: List[ObservationSequence], 
-                                   dependency_map: Dict) -> Dict[str, int]:
-    """Calculate how many tasks depend on each task (bottleneck score including indirect dependencies)"""
-    bottleneck_scores = defaultdict(int)
-    
-    def count_all_dependents(task_num: str, visited: set = None) -> int:
-        if visited is None:
-            visited = set()
-        if task_num in visited:
-            return 0
-        visited.add(task_num)
-        
-        # Find direct dependents
-        direct_dependents = [t for t, deps in dependency_map.items() if task_num in deps]
-        total_dependents = len(direct_dependents)
-        
-        # Add indirect dependents
-        for dependent in direct_dependents:
-            total_dependents += count_all_dependents(dependent, visited.copy())
-        
-        return total_dependents
-    
-    # Calculate bottleneck scores for all tasks
-    for obs in obs_list:
-        task_num = re.match(r"(\d{4})", obs.filename).group(1)
-        bottleneck_scores[task_num] = count_all_dependents(task_num)
-    
-    return dict(bottleneck_scores)
 
 # -----------------------------
 # Dependency handling
@@ -1169,6 +1009,7 @@ def enforce_dependencies(obs_list: List[ObservationSequence], dep_map: Dict[str,
         dfs(node)
     return result
 
+
 def check_dependencies_satisfied(task_num: str, completed_tasks: set, dep_map: Dict) -> bool:
     """Check if all dependencies for a task are satisfied"""
     if task_num not in dep_map:
@@ -1177,190 +1018,6 @@ def check_dependencies_satisfied(task_num: str, completed_tasks: set, dep_map: D
     dependencies = dep_map[task_num]
     return all(dep in completed_tasks for dep in dependencies)
 
-# -----------------------------
-# Find best task for schedule gap
-# -----------------------------
-def find_best_task_for_gap(available_tasks: List[ObservationSequence],
-                          current_time: datetime,
-                          gap_duration: float,
-                          bottleneck_scores: Dict,
-                          tle_line1: str, tle_line2: str) -> Optional[ObservationSequence]:
-    """Find the best task to fill a visibility gap based on priority criteria"""
-    viable_tasks = []
-    
-    for obs in available_tasks:
-        task_num = re.match(r"(\d{4})", obs.filename).group(1)
-        
-        # Check if task is visible during this gap
-        gap_end = current_time + timedelta(seconds=gap_duration)
-        vis_windows = compute_and_cache_visibility(obs.ra, obs.dec, current_time, gap_end,
-                                                 tle_line1, tle_line2)
-        
-        if not vis_windows:
-            continue
-            
-        # Check if there's sufficient visibility during the gap
-        has_sufficient_visibility = False
-        for window_start, window_end in vis_windows:
-            obs_start = max(window_start, current_time)
-            obs_end = min(window_end, gap_end)
-            available_time = (obs_end - obs_start).total_seconds()
-            
-            if available_time >= 120:  # Minimum 2 minutes
-                has_sufficient_visibility = True
-                break
-        
-        if not has_sufficient_visibility:
-            continue
-            
-        # Calculate scoring criteria
-        bottleneck_score = bottleneck_scores.get(task_num, 0)
-        
-        # Calculate future visibility scarcity
-        future_vis_windows = compute_and_cache_visibility(obs.ra, obs.dec, gap_end,
-                                                        gap_end + timedelta(days=7),
-                                                        tle_line1, tle_line2)
-        future_visibility = sum((end-start).total_seconds() for start, end in future_vis_windows)
-        scarcity_score = 1.0 / (future_visibility + 1)
-        
-        # Calculate observation requirement (shorter is better for gap filling)
-        nir_total, vda_total, nir_int_s, vda_int_s = compute_instrument_durations(obs)
-        remaining_time = max(nir_total, vda_total)
-        brevity_score = 1.0 / (remaining_time + 1)
-        
-        # Combined priority score (weighted according to your priorities)
-        priority_score = (bottleneck_score * 3.0 +  # Highest priority: dependency bottlenecks
-                         scarcity_score * 2.0 +     # Medium priority: visibility scarcity
-                         brevity_score * 1.0)       # Lowest priority: brevity
-        
-        viable_tasks.append((obs, priority_score, task_num))
-    
-    if viable_tasks:
-        # Sort by priority score (descending) and return best
-        viable_tasks.sort(key=lambda x: x[1], reverse=True)
-        best_task, score, task_num = viable_tasks[0]
-        print(f"Selected task {task_num} for gap filling (bottleneck: {bottleneck_scores.get(task_num, 0)}, score: {score:.3f})")
-        return best_task
-    
-    return None
-
-def schedule_gap_filling_task(gap_task: ObservationSequence, gap_start: datetime, gap_end: datetime,
-                             remaining_obs_time: Dict, master_root: ET.Element, visit_id: int,
-                             obs_seq_id: int, visits_written: int, 
-                             tle_line1: str, tle_line2: str) -> Optional[Tuple[datetime, int, int]]:
-    """Schedule a gap-filling task and return updated time and counters"""
-    
-    gap_task_num = re.match(r"(\d{4})", gap_task.filename).group(1)
-    
-    # Get visibility windows during the gap
-    vis_windows = compute_and_cache_visibility(gap_task.ra, gap_task.dec, gap_start, gap_end,
-                                             tle_line1, tle_line2)
-    
-    current_gap_time = gap_start
-    
-    for window_start, window_end in vis_windows:
-        if window_start < current_gap_time:
-            window_start = current_gap_time
-        if window_end > gap_end:
-            window_end = gap_end
-            
-        window_duration = (window_end - window_start).total_seconds()
-        
-        if window_duration >= 120:  # Minimum 2 minutes
-            obs_duration_needed = min(remaining_obs_time[gap_task_num], window_duration)
-            obs_duration_minutes = max(2, math.ceil(obs_duration_needed / 60))
-            obs_duration_s = obs_duration_minutes * 60
-            
-            gap_obs_end_time = window_start + timedelta(seconds=obs_duration_s)
-            updated_gap_obs = update_observation_sequence(gap_task, obs_duration_s)
-            
-            gap_visit_el = create_visit_element(updated_gap_obs, window_start, 
-                                              gap_obs_end_time, visit_id, obs_seq_id)
-            master_root.append(gap_visit_el)
-            
-            remaining_obs_time[gap_task_num] -= obs_duration_needed
-            if remaining_obs_time[gap_task_num] <= 0:
-                del remaining_obs_time[gap_task_num]
-            
-            current_gap_time = gap_obs_end_time
-            visit_id += 1
-            visits_written += 1
-            
-            print(f"Scheduled gap-filling task {gap_task_num}: {obs_duration_s}s at {format_utc_time(window_start)}")
-            return (current_gap_time, visit_id, visits_written)
-    
-    return None
-
-def find_schedulable_tasks_for_gap(obs_list: List[ObservationSequence], 
-                                 current_time: datetime,
-                                 gap_end_time: datetime,
-                                 completed_tasks: set,
-                                 task_progress: Dict[str, Dict],
-                                 dep_map: Dict,
-                                 tle_line1: str, tle_line2: str) -> Optional[Tuple[ObservationSequence, float]]:
-    """
-    Find tasks that can be scheduled during a gap
-    Returns (observation, available_time) or None
-    """
-    
-    gap_duration = (gap_end_time - current_time).total_seconds()
-    if gap_duration < 120:  # Minimum 2 minutes needed
-        return None
-    
-    candidate_tasks = []
-    
-    for obs in obs_list:
-        task_num = re.match(r"(\d{4})", obs.filename).group(1)
-        
-        # Skip if already completed
-        if task_num in completed_tasks:
-            continue
-            
-        # Skip special tasks that have specific scheduling requirements
-        if task_num == "0342":  # Moon cardinal pointing task
-            continue
-            
-        # Check dependencies
-        if not check_dependencies_satisfied(task_num, completed_tasks, dep_map):
-            continue
-        
-        # Check if task is visible during the gap
-        vis_windows = compute_and_cache_visibility(obs.ra, obs.dec, current_time, gap_end_time,
-                                                 tle_line1, tle_line2)
-        
-        if vis_windows:
-            # Calculate available observation time
-            available_time = 0
-            for window_start, window_end in vis_windows:
-                overlap_start = max(window_start, current_time)
-                overlap_end = min(window_end, gap_end_time)
-                if overlap_end > overlap_start:
-                    available_time += (overlap_end - overlap_start).total_seconds()
-            
-            if available_time >= 120:  # At least 2 minutes available
-                # Calculate remaining time for this task
-                if task_num in task_progress:
-                    remaining_seconds = task_progress[task_num]
-                else:
-                    nir_total, vda_total, nir_int_s, vda_int_s = compute_instrument_durations(obs)
-                    remaining_seconds = int(math.ceil(max(nir_total, vda_total)))
-                    task_progress[task_num] = remaining_seconds
-                
-                # Calculate priority score - higher is better
-                # Consider: dependency bottleneck factor, time remaining, fit to gap
-                dependency_factor = sum(1 for t, deps in dep_map.items() if task_num in deps)
-                fit_factor = 1.0 - abs(remaining_seconds - available_time) / max(remaining_seconds, available_time)
-                priority_score = dependency_factor * 10 + fit_factor * 5
-                
-                candidate_tasks.append((obs, priority_score, available_time, task_num))
-    
-    if candidate_tasks:
-        # Sort by priority score (highest first) and return best candidate
-        candidate_tasks.sort(key=lambda x: x[1], reverse=True)
-        best_task, _, available_time, task_num = candidate_tasks[0]
-        return best_task, available_time
-    
-    return None
 
 # -----------------------------
 # Core merging + scheduling loop
@@ -1646,707 +1303,6 @@ def merge_schedules(input_paths: List[str], output_path: str,
         "exceeded_commissioning": exceeded_commissioning
     }
 
-# def merge_schedules(input_paths: List[str], output_path: str,
-#                     cvz_coords: Tuple[float, float],
-#                     tle_line1: str, tle_line2: str,
-#                     commissioning_start: datetime = COMMISSIONING_START,
-#                     commissioning_end: datetime = COMMISSIONING_END,
-#                     pointing_ephem_file: Optional[str] = None,
-#                     dependency_json: Optional[str] = None,
-#                     progress_json: Optional[str] = None,
-#                     extra_cvz_json: Optional[str] = None,
-#                     enable_gap_filling: bool = False) -> Dict:
-   
-#    # Ensure all input times are in UTC
-#     commissioning_start = ensure_utc_time(commissioning_start)
-#     commissioning_end = ensure_utc_time(commissioning_end)
-
-#     # Calculate extended end time for scheduling
-#     extended_end = ensure_utc_time(commissioning_end + EXTENDED_SCHEDULING_PERIOD)
-    
-#     obs_list = [parse_task_xml(p) for p in input_paths]
-
-#     # load dependency / progress / cvz files
-#     dep_map = {}
-#     if dependency_json and os.path.exists(dependency_json):
-#         with open(dependency_json) as f:
-#             dep_map = json.load(f)
-#         obs_list = enforce_dependencies(obs_list, dep_map)
-#     else:
-#         obs_list.sort(key=lambda o: (int(o.visit_id), int(o.obs_id)))
-
-#     completed = {}
-#     if progress_json and os.path.exists(progress_json):
-#         with open(progress_json) as f:
-#             completed = json.load(f)
-
-#     obs_list = [o for o in obs_list if not (o.filename[:4] in completed and completed[o.filename[:4]] == "done")]
-
-#    # Load extra CVZ blocks for timeline integration
-#     extra_cvz_blocks = []
-#     if extra_cvz_json and os.path.exists(extra_cvz_json):
-#         with open(extra_cvz_json) as f:
-#             cvz_blocks = json.load(f)
-#         for block in cvz_blocks:
-#             s = datetime.fromisoformat(block["start"])
-#             e = datetime.fromisoformat(block["stop"])
-#             extra_cvz_blocks.append((s, e))
-#         # Sort CVZ blocks by start time
-#         extra_cvz_blocks.sort(key=lambda x: x[0])
-
-#     master_root = ET.Element('ScienceCalendar')
-#     if obs_list:
-#         meta = obs_list[0].xml_root.find('cal:Meta', namespaces=NS)
-#         if meta is not None:
-#             master_root.append(meta)
-
-#     # Initialize scheduling variables
-#     current_time = align_to_minute_boundary(commissioning_start)
-#     tle_data = (tle_line1, tle_line2)
-#     visit_id = 0
-#     obs_seq_id = 1
-#     total_bytes = 0
-#     visits_written = 0
-#     exceeded_commissioning = False
-
-#     last_target = None
-#     visit_el = None
-
-#     # Calculate dependency bottlenecks for gap-filling optimization (if enabled)
-#     bottleneck_scores = {}
-#     remaining_obs_time = {}
-    
-#     if enable_gap_filling:
-#         bottleneck_scores = calculate_dependency_bottlenecks(obs_list, dep_map)
-        
-#         # Track remaining observation time for each task
-#         for obs in obs_list:
-#             task_num = re.match(r"(\d{4})", obs.filename).group(1)
-#             if task_num not in completed or (isinstance(completed[task_num], dict) and "remaining" in completed[task_num]):
-#                 if task_num in completed and isinstance(completed[task_num], dict):
-#                     remaining_obs_time[task_num] = completed[task_num]["remaining"]
-#                 else:
-#                     nir_total, vda_total, nir_int_s, vda_int_s = compute_instrument_durations(obs)
-#                     remaining_obs_time[task_num] = int(math.ceil(max(nir_total, vda_total)))
-
-#     # Verify CVZ visibility
-#     verify_cvz_visibility(cvz_coords[0], cvz_coords[1], current_time, commissioning_end, tle_data)
-
-#     print(obs_list)
-#     for obs in obs_list:
-#         print("Parsed: ", obs.filename, "RA: ", obs.ra, "Dec: ", obs.dec)
-#         tasknum = re.match(r"(\d{4})", obs.filename).group(1)
-
-#         if current_time > commissioning_end and not exceeded_commissioning:
-#             exceeded_commissioning = True
-#             print(f"Warning: Scheduling has exceeded commissioning period at {format_utc_time(current_time)}")
-
-#         # Check if any extra CVZ blocks should be scheduled before this observation
-#         while extra_cvz_blocks and extra_cvz_blocks[0][0] <= current_time:
-#             cvz_start, cvz_end = extra_cvz_blocks.pop(0)
-#             if cvz_end > current_time:
-#                 # Schedule this CVZ block
-#                 actual_start = max(cvz_start, current_time)
-#                 cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], actual_start, cvz_end, visit_id, obs_seq_id)
-#                 master_root.append(cvz_visit)
-#                 visit_id += 1
-#                 visits_written += 1
-#                 current_time = align_to_minute_boundary(cvz_end)
-
-#         # Handle special tasks 0341 and 0342 (Earth/Moon cardinal pointings)
-#         if tasknum in ["0341", "0342"]:
-#             target_body = "earth" if tasknum == "0341" else "moon"
-            
-#             # For task 0342 (Moon), prioritize scheduling near full moon
-#             if tasknum == "0342":
-#                 # Calculate optimal scheduling window around full moon (±12 hours)
-#                 optimal_start = ensure_utc_time(FULL_MOON_TIME) - timedelta(hours=12)
-#                 optimal_end = ensure_utc_time(FULL_MOON_TIME) + timedelta(hours=12)
-                
-#                 # If we're not yet at the optimal window, schedule CVZ until then
-#                 if current_time < optimal_start:
-#                     cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                optimal_start, visit_id, obs_seq_id)
-#                     master_root.append(cvz_visit)
-#                     visit_id += 1
-#                     visits_written += 1
-#                     current_time = align_to_minute_boundary(optimal_start)
-#                     print(f"Scheduled CVZ until full moon optimal window for task 0342")
-
-#             if not HAVE_POINTING_PLANNER:
-#                 print(f"Warning: Task {tasknum} ({target_body} cardinal pointings) requires pointing_planner module")
-#                 continue
-                
-#             # Get cardinal pointings for this body at current time
-#             try:
-#                 # Load ephemeris data for pointing planner
-#                 if pointing_ephem_file and os.path.exists(pointing_ephem_file):
-#                     df = pp.load_ephemeris(pointing_ephem_file)
-                    
-#                     # Get 8 cardinal pointings for this body
-#                     cardinals = ["up", "ur", "right", "dr", "down", "dl", "left", "ul"]
-#                     cardinal_coords = []
-                    
-#                     for cardinal in cardinals:
-#                         try:
-#                             pointing = pp.compute_pointing(df, current_time.strftime('%Y-%m-%d %H:%M:%S'), 
-#                                                           target_body, cardinal, 15.0)
-#                             cardinal_coords.append((pointing.ra_deg, pointing.dec_deg))
-#                         except Exception as e:
-#                             print(f"Warning: Could not compute {cardinal} pointing for {target_body}: {e}")
-#                             continue
-                    
-#                     for i, (ra, dec) in enumerate(cardinal_coords):
-#                         # Create a synthetic observation for this pointing
-#                         cardinal_obs = create_cardinal_observation(obs, ra, dec, i+1)
-                        
-#                         # Process this cardinal pointing like a regular observation
-#                         nir_total, vda_total, nir_int_s, vda_int_s = compute_instrument_durations(cardinal_obs)
-#                         remaining_seconds = int(math.ceil(max(nir_total, vda_total)))
-                        
-#                         # Set special keep-out angles for cardinal pointings
-#                         kwargs = {}
-#                         if tasknum == "0341":  # Earth cardinal pointings
-#                             kwargs['earthlimb_min'] = 0*u.deg
-#                         elif tasknum == "0342":  # Moon cardinal pointings
-#                             kwargs['moon_min'] = 0*u.deg
-                        
-#                         # Calculate visibility windows for this cardinal pointing with special keep-out
-#                         vis_windows = compute_and_cache_visibility(ra, dec, current_time, 
-#                                                                  current_time + timedelta(days=7), 
-#                                                                  tle_line1, tle_line2, **kwargs)
-                        
-#                         # Check if target changed (for slew time)
-#                         target_changed = (last_target is None or 
-#                                          abs(ra - last_target[0]) > 1e-6 or 
-#                                          abs(dec - last_target[1]) > 1e-6)
-                        
-#                         # Add slew time if target changed
-#                         if target_changed and last_target is not None:
-#                             current_time = align_to_minute_boundary(current_time + timedelta(minutes=1))
-                        
-#                         # Process visibility windows for this cardinal pointing
-#                         scheduled_this_pointing = False
-#                         for window_start, window_end in vis_windows:
-#                             if window_start < current_time:
-#                                 window_start = current_time
-                            
-#                             window_duration_s = (window_end - window_start).total_seconds()
-                            
-#                             # Fill gap with CVZ if there's time between current_time and window_start
-#                             if window_start > current_time:
-#                                 cvz_duration = (window_start - current_time).total_seconds()
-#                                 if cvz_duration >= 120:  # At least 2 minutes
-
-#                                     if enable_gap_filling:
-#                                         # Try to find another task to fill this gap
-#                                         available_tasks = [o for o in obs_list 
-#                                                          if re.match(r"(\d{4})", o.filename).group(1) in remaining_obs_time
-#                                                          and re.match(r"(\d{4})", o.filename).group(1) != tasknum]
-                                        
-#                                         gap_fill_task = find_best_task_for_gap(available_tasks, current_time, gap_duration,
-#                                                                              bottleneck_scores, tle_line1, tle_line2)
-                                        
-#                                         if gap_fill_task:
-#                                             gap_task_num = re.match(r"(\d{4})", gap_fill_task.filename).group(1)
-#                                             print(f"Filling gap with task {gap_task_num} instead of CVZ")
-                                            
-#                                             # Schedule this gap-filling task
-#                                             gap_scheduled = schedule_gap_filling_task(gap_fill_task, current_time, window_start,
-#                                                                                     remaining_obs_time, master_root, visit_id,
-#                                                                                     obs_seq_id, visits_written, tle_line1, tle_line2)
-                                            
-#                                             if gap_scheduled:
-#                                                 current_time, visit_id, visits_written = gap_scheduled
-#                                             else:
-#                                                 # Fall back to CVZ
-#                                                 cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                                            window_start, visit_id, obs_seq_id)
-#                                                 master_root.append(cvz_visit)
-#                                                 visit_id += 1
-#                                                 visits_written += 1
-#                                         else:
-#                                             # Fall back to CVZ if no suitable task found
-#                                             cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                                        window_start, visit_id, obs_seq_id)
-#                                             master_root.append(cvz_visit)
-#                                             visit_id += 1
-#                                             visits_written += 1
-#                                     else:
-#                                         # Original behavior - just schedule CVZ
-#                                         cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                                    window_start, visit_id, obs_seq_id)
-#                                         master_root.append(cvz_visit)
-#                                         visit_id += 1
-#                                         visits_written += 1
-                                
-#                                 current_time = align_to_minute_boundary(window_start)
-                            
-#                             # Skip windows shorter than 2 minutes
-#                             if window_duration_s < 120:
-#                                 continue
-                                
-#                             # Calculate how much observation time we need
-#                             obs_duration_needed = min(remaining_seconds, window_duration_s)
-                            
-#                             # Round up to nearest minute, minimum 2 minutes
-#                             obs_duration_minutes = max(2, math.ceil(obs_duration_needed / 60))
-#                             obs_duration_s = obs_duration_minutes * 60
-                            
-#                             # Create observation sequence
-#                             obs_end_time = current_time + timedelta(seconds=obs_duration_s)
-                            
-#                             # Update XML with new duration and frame counts
-#                             updated_obs = update_observation_sequence(cardinal_obs, obs_duration_s)
-                            
-#                             # Create visit XML
-#                             visit_el = create_visit_element(updated_obs, current_time, obs_end_time, 
-#                                                           visit_id, obs_seq_id)
-#                             master_root.append(visit_el)
-                            
-#                             # Update counters
-#                             remaining_seconds -= obs_duration_needed
-#                             current_time = obs_end_time
-#                             visit_id += 1
-#                             visits_written += 1
-#                             scheduled_this_pointing = True
-                            
-#                             if remaining_seconds <= 0:
-#                                 break
-                        
-#                         # If we couldn't schedule this cardinal pointing, fill with CVZ
-#                         if not scheduled_this_pointing and remaining_seconds > 0:
-#                             cvz_end_time = align_to_minute_boundary(current_time + timedelta(seconds=remaining_seconds))
-#                             if cvz_end_time > current_time:
-#                                 cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                            cvz_end_time, visit_id, obs_seq_id)
-#                                 master_root.append(cvz_visit)
-#                                 visit_id += 1
-#                                 visits_written += 1
-#                                 current_time = cvz_end_time
-                        
-#                         last_target = (ra, dec)
-                        
-#             except Exception as e:
-#                 print(f"Error processing task {tasknum}: {e}")
-#                 continue
-#             else:
-#                 print(f"Warning: No ephemeris file provided for task {tasknum}")
-#                 continue
-            
-#             continue  # Skip normal processing for cardinal pointing tasks
-
-#         # Special handling for task 0312
-#         if tasknum == "0312":
-#             # Create alternating sequences using existing function
-#             task_0312_sequences = create_task_0312_sequences(obs)
-            
-#             # Create single Visit element for all Task 0312 sequences
-#             if obs.target != last_target:
-#                 if visit_el is not None:
-#                     master_root.append(visit_el)
-#                     visits_written += 1
-#                 visit_el = ET.Element('Visit')
-#                 vid = ET.SubElement(visit_el, 'ID'); vid.text = f"{visit_id:04d}"
-#                 visit_id += 1
-#                 obs_seq_id = 1
-#                 # last_target = obs.target
-#                 last_target = (obs.ra, obs.dec)
-            
-#             for seq_obs, seq_duration, seq_type in task_0312_sequences:
-#                 # Calculate visibility windows for this target
-#                 vis_windows = compute_and_cache_visibility(obs.ra, obs.dec, current_time, 
-#                                                          current_time + timedelta(days=7), 
-#                                                          tle_line1, tle_line2)
-                
-#                 # Find a visibility window that can accommodate the full sequence duration
-#                 scheduled_this_sequence = False
-#                 for window_start, window_end in vis_windows:
-#                     if window_start < current_time:
-#                         window_start = current_time
-                    
-#                     window_duration_s = (window_end - window_start).total_seconds()
-                    
-#                     # Fill gap with CVZ if there's time between current_time and window_start
-#                     if window_start > current_time:
-#                         cvz_duration = (window_start - current_time).total_seconds()
-#                         if cvz_duration >= 120:  # At least 2 minutes
-
-#                             if enable_gap_filling:
-#                                 # Try to find another task to fill this gap
-#                                 available_tasks = [o for o in obs_list 
-#                                                  if re.match(r"(\d{4})", o.filename).group(1) in remaining_obs_time
-#                                                  and re.match(r"(\d{4})", o.filename).group(1) != tasknum]
-                                
-#                                 gap_fill_task = find_best_task_for_gap(available_tasks, current_time, gap_duration,
-#                                                                      bottleneck_scores, tle_line1, tle_line2)
-                                
-#                                 if gap_fill_task:
-#                                     gap_task_num = re.match(r"(\d{4})", gap_fill_task.filename).group(1)
-#                                     print(f"Filling gap with task {gap_task_num} instead of CVZ")
-                                    
-#                                     # Schedule this gap-filling task
-#                                     gap_scheduled = schedule_gap_filling_task(gap_fill_task, current_time, window_start,
-#                                                                             remaining_obs_time, master_root, visit_id,
-#                                                                             obs_seq_id, visits_written, tle_line1, tle_line2)
-                                    
-#                                     if gap_scheduled:
-#                                         current_time, visit_id, visits_written = gap_scheduled
-#                                     else:
-#                                         # Fall back to CVZ
-#                                         cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                                    window_start, visit_id, obs_seq_id)
-#                                         master_root.append(cvz_visit)
-#                                         visit_id += 1
-#                                         visits_written += 1
-#                                 else:
-#                                     # Fall back to CVZ if no suitable task found
-#                                     cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                                window_start, visit_id, obs_seq_id)
-#                                     master_root.append(cvz_visit)
-#                                     visit_id += 1
-#                                     visits_written += 1
-#                             else:
-#                                 # Original behavior - just schedule CVZ
-#                                 cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                            window_start, visit_id, obs_seq_id)
-#                                 master_root.append(cvz_visit)
-#                                 visit_id += 1
-#                                 visits_written += 1
-                        
-#                         current_time = align_to_minute_boundary(window_start)
-                    
-#                     # Check if this window can accommodate the full sequence duration
-#                     if window_duration_s >= seq_duration:
-#                         # Round up to nearest minute, minimum 2 minutes
-#                         obs_duration_minutes = max(2, math.ceil(seq_duration / 60))
-#                         obs_duration_s = obs_duration_minutes * 60
-                        
-#                         # Create observation sequence within the same Visit
-#                         obs_seq = ET.SubElement(visit_el, 'Observation_Sequence')
-#                         oid = ET.SubElement(obs_seq, 'ID'); oid.text = f"{obs_seq_id:03d}"
-#                         obs_seq_id += 1
-                        
-#                         # Add observational parameters
-#                         obs_params = ET.SubElement(obs_seq, 'Observational_Parameters')
-#                         target_el = ET.SubElement(obs_params, 'Target'); target_el.text = seq_obs.target
-#                         priority_el = ET.SubElement(obs_params, 'Priority'); priority_el.text = "1"
-                        
-#                         # Timing comes before Boresight
-#                         timing = ET.SubElement(obs_params, 'Timing')
-#                         start_el = ET.SubElement(timing, 'Start')
-#                         stop_el = ET.SubElement(timing, 'Stop')
-#                         obs_end_time = current_time + timedelta(seconds=obs_duration_s)
-#                         start_el.text = format_utc_time(current_time)
-#                         stop_el.text = format_utc_time(obs_end_time)
-                        
-#                         # Boresight
-#                         boresight = ET.SubElement(obs_params, 'Boresight')
-#                         ra_el = ET.SubElement(boresight, 'RA'); ra_el.text = str(seq_obs.ra)
-#                         dec_el = ET.SubElement(boresight, 'DEC'); dec_el.text = str(seq_obs.dec)
-                        
-#                         # Update XML with new duration and frame counts
-#                         updated_obs = update_observation_sequence(seq_obs, obs_duration_s)
-                        
-#                         # Copy payload parameters from updated observation
-#                         original_payload = updated_obs.xml_root.find('.//cal:Payload_Parameters', namespaces=NS)
-#                         if original_payload is not None:
-#                             for child in original_payload:
-#                                 obs_seq.append(copy.deepcopy(child))
-                        
-#                         # Update counters
-#                         current_time = obs_end_time
-#                         scheduled_this_sequence = True
-                        
-#                         print(f"Scheduled Task 0312 {seq_type} sequence {obs_seq_id-1:03d}: {seq_duration}s at {format_utc_time(current_time - timedelta(seconds=obs_duration_s))}")
-#                         break
-                
-#                 # If we couldn't schedule this sequence, fill with CVZ and try to continue
-#                 if not scheduled_this_sequence:
-#                     print(f"Warning: Could not schedule Task 0312 {seq_type} sequence of {seq_duration}s")
-#                     # Add some CVZ time and continue
-#                     cvz_end_time = align_to_minute_boundary(current_time + timedelta(minutes=10))
-#                     cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                cvz_end_time, visit_id, obs_seq_id)
-#                     master_root.append(cvz_visit)
-#                     visit_id += 1
-#                     visits_written += 1
-#                     current_time = cvz_end_time
-
-#             # Append the Task 0312 visit to master_root
-#             if visit_el is not None:
-#                 master_root.append(visit_el)
-#                 visits_written += 1
-#                 visit_el = None
-            
-#             # No slew time needed since we're staying on the same target
-#             # Don't update last_target here since we want to keep the same Visit
-#             continue  # Skip normal processing for task 0312
-
-#         # Normal task processing (not 0341/0342/0312)
-#         # check progress
-#         if tasknum in completed and isinstance(completed[tasknum], dict):
-#             if "remaining" in completed[tasknum]:
-#                 remaining_seconds = completed[tasknum]["remaining"]
-#             else:
-#                 continue
-#         else:
-#             nir_total, vda_total, nir_int_s, vda_int_s = compute_instrument_durations(obs)
-#             remaining_seconds = int(math.ceil(max(nir_total, vda_total)))
-#         print(nir_total, vda_total, nir_int_s, vda_int_s)
-
-#         vis_windows = compute_and_cache_visibility(
-#             obs.ra, obs.dec, current_time, commissioning_end,
-#             tle_line1, tle_line2,
-#         )
-
-#         print(obs.target)
-#         print(obs.ra, obs.dec, current_time, commissioning_end)
-#         # print(tle_line1, tle_line2)
-#         print(vis_windows)
-
-#         # Check if target changed (for slew time)
-#         print(last_target)
-#         # print(obs.ra, last_target[0], obs.dec, last_target[1])
-#         target_changed = (
-#             last_target is None or
-#             abs(obs.ra - last_target[0]) > 1e-6 or
-#             abs(obs.dec - last_target[1]) > 1e-6
-#         )
-
-#         # Add slew time if target changed
-#         if target_changed and last_target is not None:
-#             current_time = align_to_minute_boundary(current_time + timedelta(minutes=1))
-
-#         # Process each visibility window
-#         for window_start, window_end in vis_windows:
-#             if window_start < current_time:
-#                 window_start = current_time
-            
-#             window_duration_s = (window_end - window_start).total_seconds()
-            
-#             # Fill gap with CVZ if there's time between current_time and window_start
-#             if window_start > current_time:
-#                 gap_duration = (window_start - current_time).total_seconds()
-#                 if gap_duration >= 120:  # At least 2 minutes
-
-#                     if enable_gap_filling:
-#                         # Try to find another task to fill this gap
-#                         available_tasks = [o for o in obs_list 
-#                                          if re.match(r"(\d{4})", o.filename).group(1) in remaining_obs_time
-#                                          and re.match(r"(\d{4})", o.filename).group(1) != tasknum]
-                        
-#                         gap_fill_task = find_best_task_for_gap(available_tasks, current_time, gap_duration,
-#                                                              bottleneck_scores, tle_line1, tle_line2)
-                        
-#                         if gap_fill_task:
-#                             gap_task_num = re.match(r"(\d{4})", gap_fill_task.filename).group(1)
-#                             print(f"Filling gap with task {gap_task_num} instead of CVZ")
-                            
-#                             # Schedule this gap-filling task
-#                             gap_scheduled = schedule_gap_filling_task(gap_fill_task, current_time, window_start,
-#                                                                     remaining_obs_time, master_root, visit_id,
-#                                                                     obs_seq_id, visits_written, tle_line1, tle_line2)
-                            
-#                             if gap_scheduled:
-#                                 current_time, visit_id, visits_written = gap_scheduled
-#                             else:
-#                                 # Fall back to CVZ
-#                                 cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                            window_start, visit_id, obs_seq_id)
-#                                 master_root.append(cvz_visit)
-#                                 visit_id += 1
-#                                 visits_written += 1
-#                         else:
-#                             # Fall back to CVZ if no suitable task found
-#                             cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                        window_start, visit_id, obs_seq_id)
-#                             master_root.append(cvz_visit)
-#                             visit_id += 1
-#                             visits_written += 1
-#                     else:
-#                         # Original behavior - just schedule CVZ
-#                         cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                                    window_start, visit_id, obs_seq_id)
-#                         master_root.append(cvz_visit)
-#                         visit_id += 1
-#                         visits_written += 1
-                
-#                 current_time = align_to_minute_boundary(window_start)
-            
-#             # Skip windows shorter than 2 minutes
-#             if window_duration_s < 120:
-#                 continue
-                
-#             # Calculate how much observation time we need
-#             obs_duration_needed = min(remaining_seconds, window_duration_s)
-            
-#             # Round up to nearest minute, minimum 2 minutes
-#             obs_duration_minutes = max(2, math.ceil(obs_duration_needed / 60))
-#             obs_duration_s = obs_duration_minutes * 60
-            
-#             # Create observation sequence
-#             obs_end_time = current_time + timedelta(seconds=obs_duration_s)
-            
-#             # Update XML with new duration and frame counts
-#             updated_obs = update_observation_sequence(obs, obs_duration_s)
-            
-#             # Create visit XML
-#             visit_el = create_visit_element(updated_obs, current_time, obs_end_time, 
-#                                           visit_id, obs_seq_id)
-#             master_root.append(visit_el)
-            
-#             # Update counters
-#             remaining_seconds -= obs_duration_needed
-#             current_time = obs_end_time
-#             visit_id += 1
-#             visits_written += 1
-
-#             # Update remaining observation time for gap filling
-#             if enable_gap_filling and tasknum in remaining_obs_time:
-#                 remaining_obs_time[tasknum] -= obs_duration_needed
-#                 if remaining_obs_time[tasknum] <= 0:
-#                     del remaining_obs_time[tasknum]
-            
-#             if remaining_seconds <= 0:
-#                 break
-        
-#         # If we still have remaining time, schedule CVZ until next target or end
-#         if remaining_seconds > 0:
-#             # Schedule CVZ for remaining time or until next suitable visibility window
-#             next_good_window = find_next_visibility_window(obs.ra, obs.dec, current_time, 
-#                                                          current_time + timedelta(days=7), 
-#                                                          (tle_line1, tle_line2), min_duration_s=120)
-#             if next_good_window:
-#                 cvz_end_time = next_good_window[0]
-#             else:
-#                 cvz_end_time = align_to_minute_boundary(current_time + timedelta(seconds=remaining_seconds))
-            
-#             if cvz_end_time > current_time:
-#                 cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], current_time, 
-#                                            cvz_end_time, visit_id, obs_seq_id)
-#                 master_root.append(cvz_visit)
-#                 visit_id += 1
-#                 visits_written += 1
-#                 current_time = cvz_end_time
-        
-#         last_target = (obs.ra, obs.dec)
-
-#     # Schedule any remaining extra CVZ blocks at the end
-#     while extra_cvz_blocks:
-#         cvz_start, cvz_end = extra_cvz_blocks.pop(0)
-#         actual_start = max(cvz_start, current_time)
-#         if cvz_end > actual_start:
-#             cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], actual_start, cvz_end, visit_id, obs_seq_id)
-#             master_root.append(cvz_visit)
-#             visit_id += 1
-#             visits_written += 1
-#             current_time = align_to_minute_boundary(cvz_end)
-
-#         # wi = 0
-#         # while remaining_seconds > 0 and current_time < commissioning_end:
-#         #     if wi >= len(vis_windows):
-#         #         break
-#         #     win_start, win_stop = vis_windows[wi]
-
-#         #     # Seconds available in this visibility window
-#         #     usable = int((win_stop - current_time).total_seconds())
-#         #     if usable <= 0:
-#         #         wi += 1
-#         #         current_time = win_stop
-#         #         continue
-#         #     # The chunk is the smaller if (time left in window, time left in task)
-#         #     chunk = min(usable, remaining_seconds)
-
-#         #     # If chunk >= ONE_MIN, snap down to nearest multiple of ONE_MIN
-#         #     # Otherwise, allow the short chunk (don't round to 0!)
-#         #     print(chunk)
-#         #     if chunk >= ONE_MIN:
-#         #         chunk = (chunk // ONE_MIN) * ONE_MIN
-#         #         if chunk == 0:
-#         #             chunk = ONE_MIN
-#         #     else:
-#         #         chunk = chunk
-#         #     print(chunk)
-
-#         #     # Create/reuse Visit
-#         #     if obs.target != last_target:
-#         #         if visit_el is not None:
-#         #             master_root.append(visit_el)
-#         #             visits_written += 1
-#         #         visit_el = ET.Element('Visit')
-#         #         vid = ET.SubElement(visit_el, 'ID'); vid.text = f"{visit_id:04d}"
-#         #         visit_id += 1
-#         #         obs_seq_id = 1
-#         #         last_target = obs.target
-
-#         #     # Add Observation_Sequence
-#         #     obs_seq = ET.SubElement(visit_el, 'Observation_Sequence')
-#         #     oid = ET.SubElement(obs_seq, 'ID'); oid.text = f"{obs_seq_id:03d}"
-#         #     obs_seq_id += 1
-
-#         #     # Clone payload, adjusted for chunk
-#         #     chunk_obs = adjust_payload_for_chunk(obs, chunk, nir_int_s, vda_int_s)
-#         #     template_obs = chunk_obs.xml_root.find('.//cal:Observation_Sequence', namespaces=NS)
-#         #     if template_obs is not None:
-#         #         for child in template_obs:
-#         #             if child.tag.endswith('ID'):
-#         #                 continue  # Skip duplicate ID
-#         #             obs_seq.append(ET.fromstring(ET.tostring(child)))
-
-#         #     # Update timing
-#         #     op = obs_seq.find('cal:Observational_Parameters', namespaces=NS)
-#         #     old_timing = op.find('cal:Timing', namespaces=NS)
-#         #     if old_timing is not None:
-#         #         op.remove(old_timing)
-#         #     timing_el = ET.SubElement(obs_seq.find('cal:Observational_Parameters', namespaces=NS), 'Timing')
-
-#         #     chunk_start = current_time
-#         #     chunk_stop = current_time + timedelta(seconds=chunk)
-#         #     chunk_start_str = Time(chunk_start, scale="utc").isot + "Z"
-#         #     chunk_stop_str = Time(chunk_stop, scale="utc").isot + "Z"
-#         #     ET.SubElement(timing_el, 'Start').text = chunk_start_str
-#         #     ET.SubElement(timing_el, 'Stop').text = chunk_stop_str
-
-#         #     children = list(op)
-#         #     insert_index = 2 if len(children) >= 2 else len(children)
-#         #     op.insert(insert_index, timing_el)
-
-#         #     # Estimate data volume
-#         #     chunk_bytes = estimate_data_volume_bytes(chunk_obs)
-#         #     total_bytes += chunk_bytes
-
-#         #     remaining_seconds -= chunk
-#         #     current_time = chunk_stop
-#         #     if current_time >= win_stop:
-#         #         wi += 1
-
-#     # if visit_el is not None:
-#     #     master_root.append(visit_el)
-#     #     visits_written += 1
-
-#     downlinks = math.ceil(total_bytes * 8 / (DOWNLINK_RATE_BPS * DOWNLINK_DURATION_S))
-#     # summary = {
-#     #     "total_bytes": total_bytes,
-#     #     "downlinks_required": downlinks,
-#     #     "visits_written": visits_written
-#     # }
-#     # indent(master_root)
-#     # ET.ElementTree(master_root).write(output_path, encoding='utf-8', xml_declaration=True)
-#     # write_pretty_xml(master_root, output_path)
-#     # return summary
-
-#     # Write output
-#     tree = ET.ElementTree(master_root)
-#     ET.indent(tree, space="    ", level=0)
-#     tree.write(output_path, encoding='unicode', xml_declaration=True)
-    
-#     return {
-#         "visits_written": visits_written,
-#         "total_observations": len(obs_list),
-#         "total_bytes": total_bytes,
-#         "schedule_end": current_time.isoformat()
-#     }
 
 # -----------------------------
 # Diagnostic functions
@@ -2665,6 +1621,7 @@ def analyze_schedule_diagnostics(xml_file_path: str, commissioning_end: datetime
     
     return diagnostics
 
+
 def print_diagnostics_report(diagnostics: Dict, output_format="console", output_file=None, show_detailed_sequences=False):
     """
     Print a formatted diagnostics report
@@ -2831,32 +1788,35 @@ def print_diagnostics_report(diagnostics: Dict, output_format="console", output_
     else:
         print("Invalid output format or missing output file for CSV format")
 
+
 # -----------------------------
 # CLI entrypoint
 # -----------------------------
-if __name__=="__main__":
+if __name__ == "__main__":
     import argparse
-    parser=argparse.ArgumentParser(description="Combine commissioning XML files into a master schedule.")
-    parser.add_argument("xml_dir",help="Directory containing task XML files")
-    parser.add_argument("output",help="Output master XML path")
-    parser.add_argument("--cvz-ra",type=float,required=True,help="CVZ pointing RA (deg)")
-    parser.add_argument("--cvz-dec",type=float,required=True,help="CVZ pointing DEC (deg)")
-    parser.add_argument("--tle1",type=str,required=True,help="TLE line 1")
-    parser.add_argument("--tle2",type=str,required=True,help="TLE line 2")
-    parser.add_argument("--start",type=str,default="2026-01-05T00:00:00",help="Commissioning start UTC")
-    parser.add_argument("--end",type=str,default="2026-02-05T00:00:00",help="Commissioning end UTC")
-    parser.add_argument("--ephem",type=str,default=None,help="Ephemeris file for cardinal pointings")
-    parser.add_argument("--dep",type=str,default=None,help="Dependency JSON file")
-    parser.add_argument("--progress",type=str,default=None,help="Progress JSON file")
-    parser.add_argument("--cvz",type=str,default=None,help="Extra CVZ JSON file")
-    args=parser.parse_args()
+    parser = argparse.ArgumentParser(description="Combine commissioning XML files into a master schedule.")
+    parser.add_argument("xml_dir", help="Directory containing task XML files")
+    parser.add_argument("output", help="Output master XML path")
+    parser.add_argument("--cvz-ra", type=float, required=True, help="CVZ pointing RA (deg)")
+    parser.add_argument("--cvz-dec", type=float, required=True, help="CVZ pointing DEC (deg)")
+    parser.add_argument("--tle1", type=str, required=True, help="TLE line 1")
+    parser.add_argument("--tle2", type=str, required=True, help="TLE line 2")
+    parser.add_argument("--start", type=str, default="2026-01-05T00:00:00", help="Commissioning start UTC")
+    parser.add_argument("--end", type=str, default="2026-02-05T00:00:00", help="Commissioning end UTC")
+    parser.add_argument("--ephem", type=str, default=None, help="Ephemeris file for cardinal pointings")
+    parser.add_argument("--dep", type=str, default=None, help="Dependency JSON file")
+    parser.add_argument("--progress", type=str, default=None, help="Progress JSON file")
+    parser.add_argument("--cvz", type=str, default=None, help="Extra CVZ JSON file")
+    args = parser.parse_args()
 
-    xml_paths=gather_task_xmls(args.xml_dir)
-    result=merge_schedules(xml_paths,args.output,(args.cvz_ra,args.cvz_dec),args.tle1,args.tle2,
-                           commissioning_start=datetime.fromisoformat(args.start),
-                           commissioning_end=datetime.fromisoformat(args.end),
-                           pointing_ephem_file=args.ephem,
-                           dependency_json=args.dep,
-                           progress_json=args.progress,
-                           extra_cvz_json=args.cvz)
-    print("Merge complete:",result)
+    xml_paths = gather_task_xmls(args.xml_dir)
+    result = merge_schedules(
+        xml_paths, args.output, (args.cvz_ra, args.cvz_dec), args.tle1, args.tle2,
+        commissioning_start=datetime.fromisoformat(args.start),
+        commissioning_end=datetime.fromisoformat(args.end),
+        pointing_ephem_file=args.ephem,
+        dependency_json=args.dep,
+        progress_json=args.progress,
+        extra_cvz_json=args.cvz
+    )
+    print("Merge complete:", result)
