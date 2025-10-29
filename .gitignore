@@ -8,6 +8,7 @@ docs/detailed_schedule.csv
 docs/task_order_durations.csv
 src/commissioningscheduler/.vis_cache
 docs/.vis_cache
+docs/master_schedule.xml
 
 # Mac things
 .DS_Store
