@@ -1,1822 +1,1629 @@
+# scheduling.py
 """
-File: scheduler.py
-Purpose: Merge Commissioning-task XML schedule fragments into a master ScienceCalendar XML.
-Now includes real pandora-visibility integration and Visit/Observation_Sequence ID handling.
-Adds support for dynamic Earth/Moon cardinal pointings (tasks 0341/0342) via external pointing_planner,
-special keep-out overrides for those tasks, and visibility caching with full-window cache.
+Core scheduling logic for telescope observations.
+
+This module orchestrates:
+- Loading and parsing observations
+- Computing visibility windows
+- Scheduling observations respecting dependencies and constraints
+- Handling CVZ idle pointings
+- Creating the final schedule
 """
 
-import os
-import re
-import math
 import json
-import pickle
-import hashlib
-import copy
-import numpy as np
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import List, Tuple, Optional, Dict
-import xml.etree.ElementTree as ET
-from collections import defaultdict
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple, Optional, Set, Any
+from collections import defaultdict, deque
 
-from astropy import units as u
-from astropy.coordinates import SkyCoord
-from astropy.time import Time, TimeDelta
-from pandoravisibility import Visibility
+from astropy.time import Time
 
-# optional external pointing planner (user-provided file)
-try:
-    # import .pointing_planner as pp
-    from .pointing_planner import *
-    HAVE_POINTING_PLANNER = True
-except Exception:
-    HAVE_POINTING_PLANNER = False
+from models import (
+    Observation, ObservationSequence,
+    SchedulerConfig, SchedulingResult, BlockedTimeConstraint,
+    BlockedTimeWindow, ContinuousObservationConstraint
+)
+from xml_io import ObservationParser, ScheduleWriter
+from visibility import (
+    VisibilityCalculator,
+    find_visible_cvz_pointing,
+    compute_antisolar_coordinates,
+)
+from constraints import (
+    ConstraintChecker, SpecialConstraintHandler, Task0312Handler
+)
+from utils import (
+    align_to_minute_boundary, format_utc_time, parse_utc_time,
+    compute_data_volume_gb
+)
 
-# -----------------------------
-# Config / Constants
-# -----------------------------
-DOWNLINK_RATE_BPS = 5e6  # 5 Mbps
-DOWNLINK_DURATION_S = 8 * 60  # 8 minutes
-COMMISSIONING_START = datetime(2026, 1, 5, 0, 0, 0)
-COMMISSIONING_END = datetime(2026, 2, 4, 23, 59, 59)
-EXTENDED_SCHEDULING_PERIOD = timedelta(days=30)  # One month extension
-TEN_MIN = 600
-ONE_MIN = 60
-BYTES_PER_PIXEL = 2
-VIS_FRAME_OVERHEAD_BYTES = 1000
-VIS_CACHE_DIR = '.vis_cache'
-os.makedirs(VIS_CACHE_DIR, exist_ok=True)
-FULL_MOON_TIME = datetime(2026, 2, 2, 22, 9, 0)  # 10:09 PM UTC on Feb 2, 2026
-
-NS = "/pandora/calendar/"
-ET.register_namespace("", NS)
-NS = {"cal": "/pandora/calendar/"}
-
-# def make_tag(name: str) -> str:
-#     return f"{{{NS}}}{name}"
+logger = logging.getLogger(__name__)
 
 
-# -----------------------------
-# Data classes
-# -----------------------------
-@dataclass
-class ObservationSequence:
-    filename: str
-    visit_id: str
-    obs_id: str
-    target: str
-    ra: Optional[float]
-    dec: Optional[float]
-    xml_tree: ET.ElementTree
-    xml_root: ET.Element
-
-
-# -----------------------------
-# XML Indent Function
-# -----------------------------
-def indent(elem, level: int = 0):
+class Scheduler:
     """
-    Pretty-print XML tree by adjusting .text and .tail for proper indentation.
-    Ensures sibling tags align and closing tags are not over-indented.
+    Main scheduler class that orchestrates observation scheduling.
+    
+    Usage:
+        config = SchedulerConfig(...)
+        scheduler = Scheduler(config)
+        result = scheduler.schedule(xml_paths, output_path)
     """
-    i = "\n" + level * "    "
-    if len(elem):  # if the element has children
-        if not elem.text or not elem.text.strip():
-            elem.text = i + "    "
-        for child in elem:
-            indent(child, level + 1)
-        if not elem[-1].tail or not elem[-1].tail.strip():
-            elem[-1].tail = i
-    else:  # leaf element
-        if not elem.text or not elem.text.strip():
-            elem.text = ""
-    if level and (not elem.tail or not elem.tail.strip()):
-        elem.tail = i
-    elif level == 0:
-        elem.tail = "\n"
-
-
-# -----------------------------
-# Visibility caching
-# -----------------------------
-def _vis_cache_key(ra: float, dec: float, tle1: str, tle2: str, key_extra: str = "") -> str:
-    s = f"{ra}:{dec}:{tle1}:{tle2}:{key_extra}"
-    return hashlib.sha256(s.encode('utf-8')).hexdigest()
-
-
-def load_visibility_cache(ra: float, dec: float, tle1: str, tle2: str, key_extra: str = "") -> Optional[List[Tuple[datetime, datetime]]]:
-    key = _vis_cache_key(ra, dec, tle1, tle2, key_extra)
-    path = os.path.join(VIS_CACHE_DIR, key + '.pkl')
-    if os.path.exists(path):
-        try:
-            with open(path, 'rb') as f:
-                return pickle.load(f)
-        except Exception:
-            return None
-    return None
-
-
-def save_visibility_cache(ra: float, dec: float, tle1: str, tle2: str, windows: List[Tuple[datetime, datetime]], key_extra: str = ""):
-    key = _vis_cache_key(ra, dec, tle1, tle2, key_extra)
-    path = os.path.join(VIS_CACHE_DIR, key + '.pkl')
-    with open(path, 'wb') as f:
-        pickle.dump(windows, f)
-
-
-def compute_and_cache_visibility(ra: float, dec: float, start: datetime, end: datetime,
-                                 tle1: str, tle2: str,
-                                 *, moon_min: Optional[u.Quantity] = None,
-                                 earthlimb_min: Optional[u.Quantity] = None) -> List[Tuple[datetime, datetime]]:
-    """
-    Compute visibility windows for a target (ra,dec) over [start,end].
-    Cache full commissioning window grid (1-min cadence) per target and slice as needed.
-    moon_min or earthlimb_min can override keep-out for special tasks.
-    """
-    key_extra = f"moon_min={moon_min}_earthlimb_min={earthlimb_min}"
-    cached = load_visibility_cache(ra, dec, tle1, tle2, key_extra)
-    if cached is None:
-        kwargs = {}
-        if moon_min is not None:
-            kwargs['moon_min'] = moon_min
-        if earthlimb_min is not None:
-            kwargs['earthlimb_min'] = earthlimb_min
-        vis = Visibility(tle1, tle2, **kwargs) if kwargs else Visibility(tle1, tle2)
-        tstart = Time(COMMISSIONING_START)
-        tstop = Time(COMMISSIONING_END + EXTENDED_SCHEDULING_PERIOD)
-        deltas = np.arange(0, (tstop - tstart).to_value(u.min), 1) * u.min
-        times = tstart + TimeDelta(deltas)
-        target_coord = SkyCoord(ra, dec, frame="icrs", unit="deg")
-        targ_vis = vis.get_visibility(target_coord, times)
-        windows: List[Tuple[datetime, datetime]] = []
-        in_window = False
-        win_start = None
-        for i, visible in enumerate(targ_vis):
-            if visible and not in_window:
-                in_window = True
-                win_start = times[i].to_datetime()
-            elif not visible and in_window:
-                in_window = False
-                win_stop = times[i].to_datetime()
-                windows.append((win_start, win_stop))
-        if in_window:
-            windows.append((win_start, times[-1].to_datetime()))
-        save_visibility_cache(ra, dec, tle1, tle2, windows, key_extra)
-        cached = windows
-    sliced = []
-    for ws, we in cached:
-        if we < start or ws > end:
-            continue
-        sliced.append((max(ws, start), min(we, end)))
-    return sliced
-
-
-# -----------------------------
-# Helper: parse xml into ObservationSequence
-# -----------------------------
-def parse_task_xml(path: str) -> ObservationSequence:
-    # print(path)
-    tree = ET.parse(path)
-    root = tree.getroot()
-    NS = {"cal": "/pandora/calendar/"}
-    fn = os.path.basename(path)
-    m = re.match(r"(\d{4})_(\d{3})_.*\.xml", fn)
-    if m:
-        visit_id, obs_id = m.group(1), m.group(2)
-    else:
-        visit_id, obs_id = "0000", "000"
-
-    tgt_elem = root.find('.//cal:Observational_Parameters/cal:Target', namespaces=NS)
-    # print(tgt_elem)
-    target = tgt_elem.text if tgt_elem is not None else ''
-    ra_elem = root.find('.//cal:Observational_Parameters/cal:Boresight/cal:RA', namespaces=NS)
-    # print(ra_elem)
-    dec_elem = root.find('.//cal:Observational_Parameters/cal:Boresight/cal:DEC', namespaces=NS)
-    def parse_angle(elem):
-        if elem is None or elem.text is None:
-            return None
-        try:
-            return float(elem.text.strip().split()[0])
-        except Exception:
-            return None
-    ra = parse_angle(ra_elem)
-    dec = parse_angle(dec_elem)
-    return ObservationSequence(filename=fn, visit_id=visit_id, obs_id=obs_id,
-                               target=target, ra=ra, dec=dec,
-                               xml_tree=tree, xml_root=root)
-
-
-# -----------------------------
-# Helper: compute durations from payload parameters
-# -----------------------------
-def compute_instrument_durations(obs: ObservationSequence) -> Tuple[float, float, float, float]:
-    root = obs.xml_root
-    nir_total_s = nir_integration_s = 0.0
-    nir = root.find('.//cal:AcquireInfCamImages', namespaces=NS)
-    if nir is not None:
-        ROI_SizeX = int(nir.findtext('cal:ROI_SizeX', '0', namespaces=NS))
-        ROI_SizeY = int(nir.findtext('cal:ROI_SizeY', '0', namespaces=NS))
-        SC_Resets1 = int(nir.findtext('cal:SC_Resets1', '0', namespaces=NS))
-        SC_Resets2 = int(nir.findtext('cal:SC_Resets2', '0', namespaces=NS))
-        SC_DropFrames1 = int(nir.findtext('cal:SC_DropFrames1', '0', namespaces=NS))
-        SC_DropFrames2 = int(nir.findtext('cal:SC_DropFrames2', '0', namespaces=NS))
-        SC_DropFrames3 = int(nir.findtext('cal:SC_DropFrames3', '0', namespaces=NS))
-        SC_ReadFrames = int(nir.findtext('cal:SC_ReadFrames', '0', namespaces=NS))
-        SC_Integrations = int(nir.findtext('cal:SC_Integrations', '0', namespaces=NS))
-        group_sum = (SC_Resets1 + SC_Resets2 + SC_DropFrames1 +
-                     SC_DropFrames2 + SC_DropFrames3 + SC_ReadFrames + 1)
-        nir_integration_s = (ROI_SizeX * ROI_SizeY + (ROI_SizeY * 12)) * 0.00001 * group_sum
-        nir_total_s = nir_integration_s * SC_Integrations
-
-    vda_total_s = vda_integration_s = 0.0
-    vda = root.find('.//cal:AcquireVisCamImages', namespaces=NS)
-    vda_science = root.find('.//cal:AcquireVisCamScienceData', namespaces=NS)
-    if vda is not None:
-        ExposureTime_us = float(vda.findtext('cal:ExposureTime_us', '0', namespaces=NS))
-        NumExposures = int(vda.findtext('cal:NumExposures', '0', namespaces=NS))
-        vda_integration_s = ExposureTime_us / 1e6
-        vda_total_s = vda_integration_s * NumExposures
-    elif vda_science is not None:
-        ExposureTime_us = float(vda_science.findtext('cal:ExposureTime_us', '0', namespaces=NS))
-        NumTotalFramesRequested = int(vda_science.findtext('cal:NumTotalFramesRequested', '0', namespaces=NS))
-        FramesPerCoadd = int(vda_science.findtext('cal:FramesPerCoadd', '1', namespaces=NS))
-        vda_integration_s = (ExposureTime_us / 1e6) * FramesPerCoadd
-        vda_total_s = (ExposureTime_us / 1e6) * NumTotalFramesRequested
-
-    return nir_total_s, vda_total_s, nir_integration_s, vda_integration_s
-
-
-# -----------------------------
-# Helper: update observation sequence
-# -----------------------------
-def update_observation_sequence(obs: ObservationSequence, duration_s: float) -> ObservationSequence:
-    """Update observation sequence with new duration and frame counts"""
     
-    # Create a deep copy of the observation
-    new_tree = copy.deepcopy(obs.xml_tree)
-    new_root = new_tree.getroot()
-    
-    # Calculate exposure parameters from original XML
-    nir_total, vda_total, nir_int_s, vda_int_s = compute_instrument_durations(obs)
-    
-    # Determine which instrument takes longer (limiting factor)
-    if nir_total >= vda_total:
-        # NIR is limiting - scale based on NIR timing
-        scale_factor = duration_s / nir_total if nir_total > 0 else 1
+    def __init__(self, config: SchedulerConfig):
+        """Initialize scheduler."""
+        self.config = config
+        self.parser = ObservationParser(keep_raw_tree=config.keep_raw_xml_trees)
+        self.writer = ScheduleWriter(config)
+        self.constraint_checker = ConstraintChecker(config)
+        self.special_constraints = SpecialConstraintHandler()
         
-        # Update AcquireInfCamImages
-        nir_cmd = new_root.find('.//cal:AcquireInfCamImages', namespaces=NS)
-        if nir_cmd is not None:
-            sc_integrations = nir_cmd.find('cal:SC_Integrations', namespaces=NS)
-            if sc_integrations is not None:
-                original_integrations = int(sc_integrations.text)
-                new_integrations = max(1, int(original_integrations * scale_factor))
-                sc_integrations.text = str(new_integrations)
-    else:
-        # VDA is limiting - scale based on VDA timing
-        scale_factor = duration_s / vda_total if vda_total > 0 else 1
-    
-    # Update VDA commands
-    # AcquireVisCamImages
-    vda_images = new_root.find('.//cal:AcquireVisCamImages', namespaces=NS)
-    if vda_images is not None:
-        num_exposures = vda_images.find('cal:NumExposures', namespaces=NS)
-        if num_exposures is not None:
-            original_exposures = int(num_exposures.text)
-            new_exposures = max(1, int(original_exposures * scale_factor))
-            num_exposures.text = str(new_exposures)
-    
-    # AcquireVisCamScienceData
-    vda_science = new_root.find('.//cal:AcquireVisCamScienceData', namespaces=NS)
-    if vda_science is not None:
-        num_frames = vda_science.find('cal:NumTotalFramesRequested', namespaces=NS)
-        if num_frames is not None:
-            original_frames = int(num_frames.text)
-            new_frames = max(1, int(original_frames * scale_factor))
-            num_frames.text = str(new_frames)
-    
-    return ObservationSequence(
-        filename=obs.filename,
-        visit_id=obs.visit_id,
-        obs_id=obs.obs_id,
-        target=obs.target,
-        ra=obs.ra,
-        dec=obs.dec,
-        xml_tree=new_tree,
-        xml_root=new_root
-    )
-
-
-def process_normal_task(obs: ObservationSequence, 
-                       current_time: datetime, 
-                       cvz_coords: Tuple[float, float], 
-                       master_root: ET.Element, 
-                       visit_id: int,
-                       tle_line1: str, 
-                       tle_line2: str) -> Optional[Tuple[int, datetime]]:
-    """Process a normal observation task"""
-    
-    # Extract task number
-    task_match = re.match(r"(\d{4})", obs.filename)
-    task_num = task_match.group(1) if task_match else None
-
-    # Calculate observation requirements
-    nir_total, vda_total, nir_int_s, vda_int_s = compute_instrument_durations(obs)
-    remaining_seconds = int(math.ceil(max(nir_total, vda_total)))
-    
-    print(f"Observation needs {remaining_seconds/60:.1f} minutes")
-    
-    # Get visibility windows
-    vis_windows = compute_and_cache_visibility(obs.ra, obs.dec, current_time, 
-                                             current_time + timedelta(days=7), 
-                                             tle_line1, tle_line2)
-    
-    if not vis_windows:
-        print(f"No visibility windows found for {obs.filename}")
-        return None
-    
-    # Create new visit for this task
-    visit_el = ET.Element('Visit')
-    ET.SubElement(visit_el, 'ID').text = f"{visit_id:04d}"
-    obs_seq_id = 1
-    
-    scheduled_any = False
-    
-    # Process visibility windows
-    for window_start, window_end in vis_windows:
-        if remaining_seconds <= 0:
-            break
-            
-        if window_start < current_time:
-            window_start = current_time
+        # Tracking - SIMPLIFIED
+        self.current_time = config.commissioning_start
+        self.scheduled_sequences: List[ObservationSequence] = []  # Just a flat list
         
-        window_duration_s = (window_end - window_start).total_seconds()
+        # Dependency tracking
+        self.dependencies: Dict[str, List[str]] = {}
+        self.completed_tasks: Set[str] = set()
+        self.completed_observations: Set[str] = set()
         
-        # Fill gap with CVZ if needed
-        if window_start > current_time:
-            gap_duration = (window_start - current_time).total_seconds()
-            if gap_duration >= 120:  # At least 2 minutes
-                # Split CVZ gap into 90-minute chunks
-                cvz_segments = split_long_observation_time(gap_duration, 5400)
+        # Blocked time tracking
+        self.blocked_time_constraints: List[BlockedTimeConstraint] = []
+        self.blocked_time_windows: List[BlockedTimeWindow] = []
+        
+        # Last pointing for overhead calculation
+        self.last_ra: Optional[float] = None
+        self.last_dec: Optional[float] = None
+        
+        logger.info(f"Initialized Scheduler: {config.commissioning_start} to {config.commissioning_end}")
+    
+    def schedule(self, xml_paths: List[str], output_path: str) -> SchedulingResult:
+        """Main scheduling entry point."""
+        logger.info("="*80)
+        logger.info("STARTING SCHEDULING PROCESS")
+        logger.info("="*80)
+        
+        # Step 1: Parse observations
+        logger.info("\n[STEP 1/7] Parsing observation XML files...")
+        observations = self._parse_observations(xml_paths)
+        if not observations:
+            return SchedulingResult(success=False, message="No observations to schedule")
+        logger.info(f"✓ Parsed {len(observations)} observations")
+        
+        # Step 2: Load constraints
+        logger.info("\n[STEP 2/7] Loading constraints...")
+        self._load_constraints()
+        logger.info("✓ Constraints loaded")
+        
+        # Step 3: Schedule fixed blocked time first
+        logger.info("\n[STEP 3/7] Scheduling fixed blocked time windows...")
+        self._schedule_fixed_blocked_time()
+        logger.info("✓ Fixed blocked time scheduled")
+        
+        # Step 4: Compute visibility
+        logger.info("\n[STEP 4/7] Computing visibility windows...")
+        self._compute_visibility(observations)
+        logger.info("✓ Visibility computation complete")
+
+        # Debug: Print visibility for 0312_000
+        obs_0312 = next((o for o in observations if o.obs_id == "0312_000"), None)
+        if obs_0312:
+            print_visibility_windows_for_observation(obs_0312)
+        
+        # Step 5: Schedule observations
+        logger.info("\n[STEP 5/7] Scheduling observations...")
+        unscheduled = self._schedule_observations(observations)
+        logger.info(f"✓ Scheduled {len(observations) - len(unscheduled)}/{len(observations)} observations")
+        
+        # Step 6: Fill gaps with CVZ pointings
+        logger.info("\n[STEP 6/7] Filling gaps with CVZ idle pointings...")
+        self._fill_cvz_gaps()
+        logger.info("✓ CVZ gap filling complete")
+        
+        # Step 7: Sort sequences chronologically and create visits
+        logger.info("\n[STEP 7/7] Organizing sequences into visits and writing output...")
+        self.scheduled_sequences.sort(key=lambda s: s.start)
+        
+        # Group sequences into visits (done by XML writer)
+        metadata = self._generate_metadata()
+        self.writer.write_schedule_from_sequences(self.scheduled_sequences, output_path, metadata)
+        logger.info(f"✓ Schedule written to {output_path}")
+        
+        # Generate result
+        result = self._generate_result(self.scheduled_sequences, unscheduled)
+        
+        logger.info("\n" + "="*80)
+        logger.info("SCHEDULING COMPLETE")
+        logger.info("="*80)
+        logger.info(f"Total sequences: {len(self.scheduled_sequences)}")
+        logger.info(f"Unscheduled observations: {len(unscheduled)}")
+        logger.info("="*80 + "\n")
+        
+        # Generate result and attach sequences for diagnostics
+        result = self._generate_result(self.scheduled_sequences, unscheduled)
+        result.scheduled_sequences = self.scheduled_sequences
+
+        return result
+    
+    def _parse_observations(self, xml_paths: List[str]) -> List[Observation]:
+        """Parse all observation XML files with diagnostic logging."""
+        observations = []
+        parse_errors = []
+        
+        for xml_path in xml_paths:
+            try:
+                obs = self.parser.parse_file(xml_path)  # Uses ObservationParser from xml_io.py
+                observations.append(obs)
+                logger.debug(f"Parsed {obs.obs_id} from {xml_path}")
                 
-                for segment_duration in cvz_segments:
-                    segment_end = current_time + timedelta(seconds=segment_duration)
+                # Check for issues
+                if obs.duration is None:
+                    logger.warning(f"⚠ Observation {obs.obs_id} has no duration calculated")
+                if obs.boresight_ra is None or obs.boresight_dec is None:
+                    logger.warning(f"⚠ Observation {obs.obs_id} has no coordinates")
                     
-                    # Add CVZ to current visit
-                    cvz_seq = ET.SubElement(visit_el, 'Observation_Sequence')
-                    ET.SubElement(cvz_seq, 'ID').text = f"{obs_seq_id:03d}"
-                    obs_seq_id += 1
-                    
-                    cvz_params = ET.SubElement(cvz_seq, 'Observational_Parameters')
-                    ET.SubElement(cvz_params, 'Target').text = "CVZ_IDLE"
-                    ET.SubElement(cvz_params, 'Priority').text = "2"
-                    
-                    cvz_timing = ET.SubElement(cvz_params, 'Timing')
-                    ET.SubElement(cvz_timing, 'Start').text = format_utc_time(current_time)
-                    ET.SubElement(cvz_timing, 'Stop').text = format_utc_time(segment_end)
-                    
-                    cvz_bore = ET.SubElement(cvz_params, 'Boresight')
-                    ET.SubElement(cvz_bore, 'RA').text = f"{cvz_coords[0]}"
-                    ET.SubElement(cvz_bore, 'DEC').text = f"{cvz_coords[1]}"
-                    
-                    current_time = segment_end
-            
-            current_time = align_to_minute_boundary(window_start)
+            except Exception as e:
+                logger.error(f"Failed to parse {xml_path}: {e}")
+                parse_errors.append((xml_path, str(e)))
         
-        if window_duration_s < 120:  # Skip short windows
-            continue
-            
-        # Calculate observation time for this window
-        obs_duration_needed = min(remaining_seconds, window_duration_s)
-        obs_duration_minutes = max(2, math.ceil(obs_duration_needed / 60))
-        obs_duration_s = obs_duration_minutes * 60
+        logger.info(f"Parsed {len(observations)} observations")
         
-        # Split into 90-minute segments if needed
-        obs_segments = split_long_observation_time(obs_duration_s, 5400)
+        # Summary of parsed observations
+        if observations:
+            logger.info("\nParsed observations summary:")
+            no_duration = [o for o in observations if o.duration is None]
+            no_coords = [o for o in observations if o.boresight_ra is None or o.boresight_dec is None]
+            
+            if no_duration:
+                logger.warning(f"  {len(no_duration)} observations without duration: {[o.obs_id for o in no_duration]}")
+            if no_coords:
+                logger.warning(f"  {len(no_coords)} observations without coordinates: {[o.obs_id for o in no_coords]}")
+            
+            logger.info(f"  {len(observations) - len(no_duration)} observations with valid duration")
+            logger.info(f"  {len(observations) - len(no_coords)} observations with valid coordinates")
         
-        for segment_duration in obs_segments:
-            if remaining_seconds <= 0:
-                break
-                
-            # Create observation sequence
-            obs_end_time = current_time + timedelta(seconds=segment_duration)
-            updated_obs = update_observation_sequence(obs, segment_duration)
-            
-            obs_seq = ET.SubElement(visit_el, 'Observation_Sequence')
-            ET.SubElement(obs_seq, 'ID').text = f"{obs_seq_id:03d}"
-            obs_seq_id += 1
-            
-            # Special handling for task 0319 - copy Bus_Parameters
-            if task_num == "0319":
-                bus_params = obs.xml_root.find('.//cal:Bus_Parameters', namespaces=NS)
-                if bus_params is not None:
-                    # Copy Bus_Parameters before Observational_Parameters
-                    new_bus_params = ET.SubElement(obs_seq, 'Bus_Parameters')
-                    for child in bus_params:
-                        new_bus_params.append(copy.deepcopy(child))
-
-            obs_params = ET.SubElement(obs_seq, 'Observational_Parameters')
-            ET.SubElement(obs_params, 'Target').text = updated_obs.target
-            ET.SubElement(obs_params, 'Priority').text = "1"
-            
-            timing = ET.SubElement(obs_params, 'Timing')
-            ET.SubElement(timing, 'Start').text = format_utc_time(current_time)
-            ET.SubElement(timing, 'Stop').text = format_utc_time(obs_end_time)
-            
-            boresight = ET.SubElement(obs_params, 'Boresight')
-            ET.SubElement(boresight, 'RA').text = str(updated_obs.ra)
-            ET.SubElement(boresight, 'DEC').text = str(updated_obs.dec)
-            
-            # Copy payload parameters
-            payload = updated_obs.xml_root.find('.//cal:Payload_Parameters', namespaces=NS)
-            if payload is not None:
-                new_payload = ET.SubElement(obs_seq, 'Payload_Parameters')
-                for child in payload:
-                    new_payload.append(copy.deepcopy(child))
-            
-            current_time = obs_end_time
-            remaining_seconds -= segment_duration
-            scheduled_any = True
-    
-    # Add visit to master root if we scheduled anything
-    if scheduled_any:
-        master_root.append(visit_el)
-        return visit_id + 1, current_time
-    
-    return None
-
-
-# -----------------------------
-# Helper: make cardinal direction obs file
-# -----------------------------
-def create_cardinal_observation(template_obs, ra, dec, cardinal_direction, target_body):
-    """Create a synthetic observation for cardinal pointings with proper naming"""
-    new_tree = copy.deepcopy(template_obs.xml_tree)
-    new_root = new_tree.getroot()
-    
-    # Create target name as Body_Cardinal (e.g., "Earth_up", "Moon_down")
-    target_name = f"{target_body.capitalize()}_{cardinal_direction}"
-    
-    # Update the target name to indicate cardinal pointing
-    target_elements = new_root.findall('.//cal:Target', namespaces=NS)
-    for target_el in target_elements:
-        target_el.text = target_name
-    
-    # Update RA/DEC in boresight elements
-    ra_elements = new_root.findall('.//cal:RA', namespaces=NS)
-    dec_elements = new_root.findall('.//cal:DEC', namespaces=NS)
-    
-    for ra_el in ra_elements:
-        ra_el.text = str(ra)
-    for dec_el in dec_elements:
-        dec_el.text = str(dec)
-    
-    return ObservationSequence(
-        filename=f"{template_obs.filename}_cardinal_{cardinal_direction}",
-        visit_id=template_obs.visit_id,
-        obs_id=template_obs.obs_id,
-        target=target_name,
-        ra=ra,
-        dec=dec,
-        xml_tree=new_tree,
-        xml_root=new_root
-    )
-
-
-# -----------------------------
-# Helper: Align time to minute boundaries
-# -----------------------------
-def align_to_minute_boundary(dt):
-    """Align datetime to the next minute boundary, ensuring UTC"""
-    utc_dt = ensure_utc_time(dt)
-    
-    if utc_dt.second == 0 and utc_dt.microsecond == 0:
-        return utc_dt
-    return utc_dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
-
-
-# -----------------------------
-# Helper: format UTC time
-# -----------------------------
-def ensure_utc_time(dt):
-    """Convert datetime to UTC using astropy.time"""
-    if isinstance(dt, datetime):
-        # Convert to astropy Time object and ensure UTC
-        t = Time(dt, format='datetime', scale='utc')
-        return t.datetime
-    return dt
-
-
-def format_utc_time(dt):
-    """Format datetime to UTC string with Z suffix, ensuring UTC frame"""
-    utc_dt = ensure_utc_time(dt)
-    return utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-
-
-# -----------------------------
-# Helper: create CVZ visit
-# -----------------------------
-def create_cvz_visit(cvz_ra: float, cvz_dec: float,
-                     start: datetime, stop: datetime,
-                     visit_id: int, obs_seq_id: int) -> ET.Element:
-    
-    # Ensure UTC times
-    start_utc = ensure_utc_time(start)
-    stop_utc = ensure_utc_time(stop)
-    
-    visit = ET.Element('Visit')
-    ET.SubElement(visit, 'ID').text = f"{visit_id:04d}"
-
-    obs = ET.SubElement(visit, 'Observation_Sequence')
-    ET.SubElement(obs, 'ID').text = f"{obs_seq_id:03d}"
-
-    op = ET.SubElement(obs, 'Observational_Parameters')
-    ET.SubElement(op, 'Target').text = 'CVZ_IDLE'
-    
-    # Add Priority=2 after Target, before Timing
-    ET.SubElement(op, 'Priority').text = '2'
-
-    timing = ET.SubElement(op, 'Timing')
-    ET.SubElement(timing, 'Start').text = format_utc_time(start_utc)
-    ET.SubElement(timing, 'Stop').text = format_utc_time(stop_utc)
-
-    bore = ET.SubElement(op, 'Boresight')
-    ET.SubElement(bore, 'RA').text = f"{cvz_ra}"
-    ET.SubElement(bore, 'DEC').text = f"{cvz_dec}"
-    
-    # No Payload_Parameters for CVZ observations
-    
-    return visit
-
-
-# -----------------------------
-# Helper: Make blank stare
-# -----------------------------
-def modify_for_staring_only(obs: ObservationSequence) -> ObservationSequence:
-    """Modify observation to stare without collecting data - remove payload parameters entirely"""
-    
-    # Create a copy with modified XML
-    new_tree = copy.deepcopy(obs.xml_tree)
-    new_root = new_tree.getroot()
-    
-    # Find and remove all Payload_Parameters
-    payload_params = new_root.find('.//cal:Payload_Parameters', namespaces=NS)
-    if payload_params is not None:
-        parent = new_root.find('.//cal:Observation_Sequence', namespaces=NS)
-        if parent is not None and payload_params in parent:
-            parent.remove(payload_params)
-    
-    return ObservationSequence(
-        filename=obs.filename,
-        visit_id=obs.visit_id,
-        obs_id=obs.obs_id,
-        target=obs.target,
-        ra=obs.ra,
-        dec=obs.dec,
-        xml_tree=new_tree,
-        xml_root=new_root
-    )
-
-
-# -----------------------------
-# Helper: CVZ visibility check
-# -----------------------------
-def verify_cvz_visibility(cvz_ra, cvz_dec, start_time, end_time, tle_data):
-    """Verify that CVZ coordinates are visible during the specified time window"""
-    vis_windows = compute_and_cache_visibility(cvz_ra, cvz_dec, start_time, end_time, 
-                                             tle_data[0], tle_data[1])
-    total_visible_time = sum((end - start).total_seconds() for start, end in vis_windows)
-    total_window_time = (end_time - start_time).total_seconds()
-    
-    visibility_fraction = total_visible_time / total_window_time if total_window_time > 0 else 0
-    
-    if visibility_fraction < 0.9:  # Warn if less than 90% visible
-        print(f"Warning: CVZ coordinates ({cvz_ra}, {cvz_dec}) only {visibility_fraction:.2%} visible")
-    
-    return visibility_fraction > 0.5  # Return True if more than 50% visible
-
-
-# -----------------------------
-# Helper: Split long observations
-# -----------------------------
-def split_long_observation_time(total_duration_s: float, max_duration_s: int = 5400) -> List[float]:
-    """Split a duration into segments of max_duration_s or less"""
-    if total_duration_s <= max_duration_s:
-        return [total_duration_s]
-    
-    segments = []
-    remaining = total_duration_s
-    
-    while remaining > 0:
-        segment = min(remaining, max_duration_s)
-        segments.append(segment)
-        remaining -= segment
-    
-    return segments
-
-
-# -----------------------------
-# Helper: get schedulable observations
-# -----------------------------
-def get_schedulable_observations(obs_list: List[ObservationSequence], 
-                               completed_obs_files: set, 
-                               completed_tasks: set, 
-                               dep_map: Dict) -> List[ObservationSequence]:
-    """Get observations that can be scheduled based on dependencies"""
-    schedulable = []
-    
-    # Group observations by task
-    remaining_by_task = defaultdict(list)
-    for obs in obs_list:
-        task_match = re.match(r"(\d{4})", obs.filename)
-        if task_match:
-            task_num = task_match.group(1)
-            obs_file_key = obs.filename[:8]
-            if obs_file_key not in completed_obs_files:
-                remaining_by_task[task_num].append(obs)
-    
-    # Find tasks whose dependencies are satisfied
-    ready_tasks = []
-    for task_num, task_obs in remaining_by_task.items():
-        if check_dependencies_satisfied(task_num, completed_tasks, dep_map):
-            ready_tasks.append((task_num, task_obs))
-    
-    # Sort ready tasks by task number (maintaining order within dependencies)
-    ready_tasks.sort(key=lambda x: x[0])
-    
-    # Return observations in proper order
-    for task_num, task_obs in ready_tasks:
-        for obs in task_obs:
-            schedulable.append(obs)
-    
-    return schedulable
-
-
-# -----------------------------
-# Helper: handle task 0312
-# -----------------------------
-def create_task_0312_sequences(obs: ObservationSequence) -> List[Tuple[ObservationSequence, int, str]]:
-    """
-    Create alternating 5-minute data collection and 15-minute staring sequences for task 0312
-    Returns list of (observation_sequence, duration_s, sequence_type) tuples
-    """
-    # Get total observation time from XML
-    nir_total, vda_total, nir_int_s, vda_int_s = compute_instrument_durations(obs)
-    total_duration_s = int(math.ceil(max(nir_total, vda_total)))
-    
-    print(f"Task 0312 total observation time: {total_duration_s} seconds ({total_duration_s/60:.1f} minutes)")
-    
-    sequences = []
-    remaining_time = total_duration_s
-    is_data_collection = True  # Start with data collection
-    
-    while remaining_time > 0:
-        if is_data_collection:
-            # 5-minute data collection sequence
-            if remaining_time >= 300:  # 5 minutes
-                data_obs = copy.deepcopy(obs)
-                sequences.append((data_obs, 300, "data"))
-                remaining_time -= 300
-            else:
-                # Less than 5 minutes left, make final data collection sequence
-                data_obs = copy.deepcopy(obs)
-                sequences.append((data_obs, remaining_time, "data"))
-                remaining_time = 0
-        else:
-            # 15-minute staring sequence
-            if remaining_time >= 900:  # 15 minutes
-                stare_obs = copy.deepcopy(obs)
-                stare_obs = modify_for_staring_only(stare_obs)
-                sequences.append((stare_obs, 900, "stare"))
-                remaining_time -= 900
-            else:
-                # Less than 15 minutes left, make final staring sequence
-                stare_obs = copy.deepcopy(obs)
-                stare_obs = modify_for_staring_only(stare_obs)
-                sequences.append((stare_obs, remaining_time, "stare"))
-                remaining_time = 0
+        if parse_errors:
+            logger.error(f"\n{len(parse_errors)} files failed to parse:")
+            for path, error in parse_errors:
+                logger.error(f"  {path}: {error}")
         
-        # Alternate between data collection and staring
-        is_data_collection = not is_data_collection
-    
-    return sequences
+        # Store for later gap filling
+        self._all_observations = observations
 
-
-def process_task_0312(obs: ObservationSequence, 
-                     current_time: datetime, 
-                     cvz_coords: Tuple[float, float], 
-                     master_root: ET.Element, 
-                     visit_id: int,
-                     tle_line1: str, 
-                     tle_line2: str) -> Optional[Tuple[int, datetime]]:
-    """Process Task 0312 with alternating data collection and staring"""
+        return observations
     
-    # Create alternating sequences
-    task_0312_sequences = create_task_0312_sequences(obs)
-    
-    # Create new visit for this task
-    visit_el = ET.Element('Visit')
-    ET.SubElement(visit_el, 'ID').text = f"{visit_id:04d}"
-    obs_seq_id = 1
-    scheduled_any = False
-    
-    for seq_obs, seq_duration, seq_type in task_0312_sequences:
-        # Get visibility windows
-        vis_windows = compute_and_cache_visibility(obs.ra, obs.dec, current_time, 
-                                                 current_time + timedelta(days=7), 
-                                                 tle_line1, tle_line2)
+    def _load_constraints(self):
+        """Load constraints from JSON file (dependencies and blocked time)."""
+        # Support both new constraints.json and old dependency.json
+        constraints_file = self.config.constraints_json or self.config.dependency_json
         
-        # Find suitable visibility window
-        scheduled_this_sequence = False
-        for window_start, window_end in vis_windows:
-            if window_start < current_time:
-                window_start = current_time
-            
-            window_duration_s = (window_end - window_start).total_seconds()
-            
-            # Fill gap with CVZ if needed
-            if window_start > current_time:
-                gap_duration = (window_start - current_time).total_seconds()
-                if gap_duration >= 120:
-                    cvz_segments = split_long_observation_time(gap_duration, 5400)
-                    
-                    for segment_duration in cvz_segments:
-                        segment_end = current_time + timedelta(seconds=segment_duration)
-                        
-                        cvz_seq = ET.SubElement(visit_el, 'Observation_Sequence')
-                        ET.SubElement(cvz_seq, 'ID').text = f"{obs_seq_id:03d}"
-                        obs_seq_id += 1
-                        
-                        cvz_params = ET.SubElement(cvz_seq, 'Observational_Parameters')
-                        ET.SubElement(cvz_params, 'Target').text = "CVZ_IDLE"
-                        ET.SubElement(cvz_params, 'Priority').text = "2"
-                        
-                        cvz_timing = ET.SubElement(cvz_params, 'Timing')
-                        ET.SubElement(cvz_timing, 'Start').text = format_utc_time(current_time)
-                        ET.SubElement(cvz_timing, 'Stop').text = format_utc_time(segment_end)
-                        
-                        cvz_bore = ET.SubElement(cvz_params, 'Boresight')
-                        ET.SubElement(cvz_bore, 'RA').text = f"{cvz_coords[0]}"
-                        ET.SubElement(cvz_bore, 'DEC').text = f"{cvz_coords[1]}"
-                        
-                        current_time = segment_end
-                
-                current_time = align_to_minute_boundary(window_start)
-            
-            if window_duration_s >= seq_duration:
-                # Schedule this sequence
-                obs_duration_minutes = max(2, math.ceil(seq_duration / 60))
-                obs_duration_s = obs_duration_minutes * 60
-                
-                obs_end_time = current_time + timedelta(seconds=obs_duration_s)
-                
-                obs_seq = ET.SubElement(visit_el, 'Observation_Sequence')
-                ET.SubElement(obs_seq, 'ID').text = f"{obs_seq_id:03d}"
-                obs_seq_id += 1
-                
-                obs_params = ET.SubElement(obs_seq, 'Observational_Parameters')
-                ET.SubElement(obs_params, 'Target').text = seq_obs.target
-                ET.SubElement(obs_params, 'Priority').text = "1"
-                
-                timing = ET.SubElement(obs_params, 'Timing')
-                ET.SubElement(timing, 'Start').text = format_utc_time(current_time)
-                ET.SubElement(timing, 'Stop').text = format_utc_time(obs_end_time)
-                
-                boresight = ET.SubElement(obs_params, 'Boresight')
-                ET.SubElement(boresight, 'RA').text = str(seq_obs.ra)
-                ET.SubElement(boresight, 'DEC').text = str(seq_obs.dec)
-                
-                # Copy payload parameters (will be None for staring sequences)
-                payload = seq_obs.xml_root.find('.//cal:Payload_Parameters', namespaces=NS)
-                if payload is not None:
-                    new_payload = ET.SubElement(obs_seq, 'Payload_Parameters')
-                    for child in payload:
-                        new_payload.append(copy.deepcopy(child))
-                
-                current_time = obs_end_time
-                scheduled_this_sequence = True
-                scheduled_any = True
-                
-                print(f"Scheduled Task 0312 {seq_type} sequence: {seq_duration}s")
-                break
-        
-        if not scheduled_this_sequence:
-            print(f"Warning: Could not schedule Task 0312 {seq_type} sequence of {seq_duration}s")
-    
-    if scheduled_any:
-        master_root.append(visit_el)
-        return visit_id + 1, current_time
-    
-    return None
-
-
-# -----------------------------
-# Helper: handle tasks 0341 and 0342
-# -----------------------------
-def process_cardinal_pointing_task(obs: ObservationSequence, 
-                                 task_num: str, 
-                                 current_time: datetime, 
-                                 pointing_ephem_file: Optional[str],
-                                 cvz_coords: Tuple[float, float], 
-                                 master_root: ET.Element, 
-                                 visit_id: int, 
-                                 tle_line1: str, 
-                                 tle_line2: str) -> Optional[int]:
-    """Process cardinal pointing tasks (0341, 0342)"""
-    
-    target_body = "earth" if task_num == "0341" else "moon"
-    
-    if not HAVE_POINTING_PLANNER:
-        print(f"Warning: Task {task_num} ({target_body} cardinal pointings) requires pointing_planner module")
-        return None
-        
-    if not pointing_ephem_file or not os.path.exists(pointing_ephem_file):
-        print(f"Warning: No ephemeris file provided for task {task_num}")
-        return None
-    
-    try:
-        # df = pp.load_ephemeris(pointing_ephem_file)
-        df = load_ephemeris(pointing_ephem_file)
-        cardinals = ["up", "ur", "right", "dr", "down", "dl", "left", "ul"]
-        
-        # Create new visit for this task
-        visit_el = ET.Element('Visit')
-        ET.SubElement(visit_el, 'ID').text = f"{visit_id:04d}"
-        obs_seq_id = 1
-        scheduled_any = False
-        
-        for cardinal in cardinals:
-            # Try up to 5 times to find a valid pointing for this cardinal direction
-            scheduled_this_cardinal = False
-            attempts = 0
-            
-            while attempts < 2 and not scheduled_this_cardinal:
-                attempts += 1
-                
-                try:
-                    # If this is a retry, offset the time slightly to get a different pointing
-                    pointing_time = current_time + timedelta(minutes=attempts-1) if attempts > 1 else current_time
-                    
-                    # pointing = pp.compute_pointing(df, pointing_time.strftime('%Y-%m-%d %H:%M:%S'), 
-                    #                               target_body, cardinal, 15.0)
-                    pointing = compute_pointing(df, pointing_time.strftime('%Y-%m-%d %H:%M:%S'), 
-                                                target_body, cardinal, 15.0)
-                    ra, dec = pointing.ra_deg, pointing.dec_deg
-                    
-                    # Create cardinal observation with proper target naming
-                    cardinal_obs = create_cardinal_observation(obs, ra, dec, cardinal, target_body)
-                    
-                    # Create proper target name for TargetID fields
-                    target_name = f"{target_body.capitalize()}_{cardinal}"
-                    
-                    # Calculate durations
-                    nir_total, vda_total, nir_int_s, vda_int_s = compute_instrument_durations(cardinal_obs)
-                    remaining_seconds = int(math.ceil(max(nir_total, vda_total)))
-                    
-                    # Set special keep-out angles
-                    kwargs = {}
-                    if task_num == "0341":
-                        kwargs['earthlimb_min'] = 0*u.deg
-                    elif task_num == "0342":
-                        kwargs['moon_min'] = 0*u.deg
-                    
-                    # Get visibility windows
-                    vis_windows = compute_and_cache_visibility(ra, dec, current_time, 
-                                                             current_time + timedelta(days=7), 
-                                                             tle_line1, tle_line2, **kwargs)
-                    
-                    if not vis_windows:
-                        print(f"  Attempt {attempts}/2: No visibility windows found for {target_body}_{cardinal} pointing at RA={ra:.3f}, DEC={dec:.3f}")
-                        continue
-                    
-                    # Schedule this cardinal pointing
-                    for window_start, window_end in vis_windows:
-                        if remaining_seconds <= 0:
-                            break
-                            
-                        if window_start < current_time:
-                            window_start = current_time
-                        
-                        window_duration_s = (window_end - window_start).total_seconds()
-                        
-                        if window_duration_s < 120:
-                            continue
-                            
-                        obs_duration_needed = min(remaining_seconds, window_duration_s)
-                        obs_duration_minutes = max(2, math.ceil(obs_duration_needed / 60))
-                        obs_duration_s = obs_duration_minutes * 60
-                        
-                        # Split into 90-minute segments if needed
-                        obs_segments = split_long_observation_time(obs_duration_s, 5400)
-                        
-                        for segment_duration in obs_segments:
-                            if remaining_seconds <= 0:
-                                break
-                                
-                            obs_end_time = current_time + timedelta(seconds=segment_duration)
-                            updated_obs = update_observation_sequence(cardinal_obs, segment_duration)
-                            
-                            obs_seq = ET.SubElement(visit_el, 'Observation_Sequence')
-                            ET.SubElement(obs_seq, 'ID').text = f"{obs_seq_id:03d}"
-                            obs_seq_id += 1
-                            
-                            obs_params = ET.SubElement(obs_seq, 'Observational_Parameters')
-                            ET.SubElement(obs_params, 'Target').text = target_name
-                            ET.SubElement(obs_params, 'Priority').text = "1"
-                            
-                            timing = ET.SubElement(obs_params, 'Timing')
-                            ET.SubElement(timing, 'Start').text = format_utc_time(current_time)
-                            ET.SubElement(timing, 'Stop').text = format_utc_time(obs_end_time)
-                            
-                            boresight = ET.SubElement(obs_params, 'Boresight')
-                            ET.SubElement(boresight, 'RA').text = str(ra)
-                            ET.SubElement(boresight, 'DEC').text = str(dec)
-                            
-                            # Copy payload parameters and update TargetID values
-                            payload = updated_obs.xml_root.find('.//cal:Payload_Parameters', namespaces=NS)
-                            if payload is not None:
-                                new_payload = ET.SubElement(obs_seq, 'Payload_Parameters')
-                                for child in payload:
-                                    new_child = copy.deepcopy(child)
-                                    
-                                    # Update all TargetID fields to match the cardinal pointing target name
-                                    target_id_elems = new_child.findall('.//cal:TargetID', namespaces=NS)
-                                    for target_id_elem in target_id_elems:
-                                        target_id_elem.text = target_name
-                                    
-                                    new_payload.append(new_child)
-                            
-                            current_time = obs_end_time
-                            remaining_seconds -= segment_duration
-                            scheduled_any = True
-                            scheduled_this_cardinal = True
-                        
-                        if remaining_seconds <= 0 or scheduled_this_cardinal:
-                            break
-                    
-                except Exception as e:
-                    print(f"  Error processing {target_body}_{cardinal} pointing (attempt {attempts}/5): {e}")
-            
-            if not scheduled_this_cardinal:
-                print(f"WARNING: Failed to schedule {target_body}_{cardinal} pointing after 5 attempts")
-        
-        if scheduled_any:
-            master_root.append(visit_el)
-            return visit_id + 1
-        else:
-            print(f"ERROR: Could not schedule any cardinal pointings for task {task_num}")
-        
-    except Exception as e:
-        print(f"Error processing task {task_num}: {e}")
-    
-    return None
-
-
-# -----------------------------
-# File gatherer
-# -----------------------------
-def gather_task_xmls(xml_dir: str) -> List[str]:
-    files = [f for f in os.listdir(xml_dir) if f.lower().endswith('.xml')]
-    def key(fn: str):
-        m = re.match(r"(\d{4})_(\d{3})", fn)
-        return (int(m.group(1)), int(m.group(2))) if m else (9999, 999)
-    return [os.path.join(xml_dir, f) for f in sorted(files, key=key)]
-
-
-# -----------------------------
-# Dependency handling
-# -----------------------------
-def enforce_dependencies(obs_list: List[ObservationSequence], dep_map: Dict[str, List[str]]) -> List[ObservationSequence]:
-    # simple topological sort by task number strings
-    graph = {o.filename[:4]: set() for o in obs_list}
-    for task, preds in dep_map.items():
-        graph.setdefault(task, set()).update(preds)
-    result = []
-    visited = {}
-    def dfs(node):
-        if visited.get(node) == 'temp':
-            raise RuntimeError("Cycle in dependency graph")
-        if visited.get(node) == 'perm':
+        if not constraints_file:
+            logger.info("No constraints file specified")
             return
-        visited[node] = 'temp'
-        for p in graph.get(node, []):
-            dfs(p)
-        visited[node] = 'perm'
-        for o in obs_list:
-            if o.filename.startswith(node) and o not in result:
-                result.append(o)
-    for node in graph:
-        dfs(node)
-    return result
+        
+        try:
+            with open(constraints_file, 'r') as f:
+                constraints_data = json.load(f)
+            
+            # Load dependencies
+            if 'dependencies' in constraints_data:
+                self.dependencies = constraints_data['dependencies']
+                logger.info(f"Loaded dependencies for {len(self.dependencies)} tasks")
+            
+            # Load blocked time constraints
+            if 'blocked_time' in constraints_data:
+                for bt_def in constraints_data['blocked_time']:
+                    constraint = self._parse_blocked_time_constraint(bt_def)
+                    self.blocked_time_constraints.append(constraint)
+                logger.info(f"Loaded {len(self.blocked_time_constraints)} blocked time constraints")
+                
+                # Log each constraint
+                for bt in self.blocked_time_constraints:
+                    if bt.constraint_type == "fixed":
+                        logger.info(f"  Fixed: {bt.start} to {bt.end} ({bt.window_type})")
+                    elif bt.constraint_type == "after_task":
+                        logger.info(f"  After task {bt.task_id}: {bt.duration_minutes} min ({bt.window_type})")
+                    elif bt.constraint_type == "after_observation":
+                        logger.info(f"  After obs {bt.observation_id}: {bt.duration_minutes} min ({bt.window_type})")
+        
+            # Load continuous observation constraints
+            if 'continuous_observations' in constraints_data:
+                cont_data = constraints_data['continuous_observations']
+                constraint = ContinuousObservationConstraint(
+                    tasks=cont_data.get('tasks', []),
+                    observations=cont_data.get('observations', []),
+                    description=cont_data.get('description', '')
+                )
+                self.constraint_checker.continuous_constraints.append(constraint)
+                logger.info(
+                    f"Loaded continuous observation constraint: "
+                    f"{len(constraint.tasks)} tasks, {len(constraint.observations)} observations"
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to load constraints from {constraints_file}: {e}")
+
+    def _compute_visibility(self, observations: List[Observation]):
+        """Compute visibility windows for all observations."""
+        start_time = Time(self.config.commissioning_start)
+        end_time = Time(self.config.commissioning_end)
+        
+        # Create visibility calculator
+        self.vis_calc = VisibilityCalculator(
+            config=self.config,
+            start=start_time,
+            stop=end_time,
+            timestep_seconds=60  # TODO: Make configurable
+        )
+        
+        # Compute visibility for all observations
+        self.vis_calc.compute_for_observations(
+            observations,
+            force_recompute=False,
+            parallel=True,
+            max_workers=4,
+            attach_to_observations=True
+        )
+        
+        # Log visibility statistics
+        total_windows = sum(len(obs.visibility_windows) for obs in observations)
+        logger.info(f"Computed {total_windows} visibility windows across {len(observations)} observations")
+    
+    def _schedule_observations(self, observations: List[Observation]) -> List[Observation]: # NEEDS CHANGE
+        """
+        Schedule observations respecting dependencies and constraints.
+        
+        Returns:
+            List of unscheduled observations
+        """
+        # Store all observations for later gap filling
+        self._all_observations = observations
+
+        # Group observations by task
+        tasks = self._group_by_task(observations)
+        
+        logger.info(f"Grouped into {len(tasks)} tasks")
+        for task_id, task_obs in sorted(tasks.items()):
+            logger.info(f"  Task {task_id}: {len(task_obs)} observations")
+        
+        # Determine scheduling order using topological sort
+        schedule_order = self._topological_sort(tasks.keys())
+        
+        logger.info(f"\nScheduling order determined: {' -> '.join(schedule_order)}")
+        
+        unscheduled = []
+        
+        for idx, task_id in enumerate(schedule_order, 1):
+            logger.info(f"\n--- Processing task {task_id} ({idx}/{len(schedule_order)}) ---")
+            
+            # if not self._can_schedule_task(task_id):
+            #     prereqs = self.dependencies.get(task_id, [])
+            #     missing = [p for p in prereqs if p not in self.completed_tasks]
+            #     logger.warning(f"Dependencies not met for task {task_id} (missing: {missing}), deferring")
+            #     unscheduled.extend(tasks[task_id])
+            #     continue
+            
+            # GOOD HERE TO BOTTOM
+
+            task_obs = tasks[task_id]
+            logger.info(f"Task {task_id} has {len(task_obs)} observations to schedule")
+            
+            # Schedule each observation in the task
+            task_scheduled = 0
+            for obs_idx, obs in enumerate(task_obs, 1):
+                logger.info(f"  Scheduling observation {obs.obs_id} ({obs_idx}/{len(task_obs)})...")
+                logger.info(f"    Target: {obs.target_name or 'Unknown'}")
 
 
-def check_dependencies_satisfied(task_num: str, completed_tasks: set, dep_map: Dict) -> bool:
-    """Check if all dependencies for a task are satisfied"""
-    if task_num not in dep_map:
+                # Normal scheduling (will handle pairs if this is first in pair)
+                logger.info(f"  Scheduling observation {obs.obs_id} ({obs_idx}/{len(task_obs)})...")
+                
+                # Safe duration logging
+                if obs.duration is not None:
+                    logger.info(f"    Duration: {obs.duration:.3f} minutes ({obs.duration*60:.1f} seconds)")
+                else:
+                    logger.info(f"    Duration: Not computed")
+                    
+                # Safe coordinate logging
+                if obs.boresight_ra is not None and obs.boresight_dec is not None:
+                    logger.info(f"    Coordinates: RA={obs.boresight_ra:.4f}, DEC={obs.boresight_dec:.4f}")
+                else:
+                    logger.info(f"    Coordinates: Not specified")
+                    
+                logger.info(f"    Visibility windows: {len(obs.visibility_windows)}")
+                
+                if self._schedule_single_observation(obs):
+                    logger.info(f"    ✓ Successfully scheduled {obs.obs_id}")
+                    task_scheduled += 1
+
+                    # Check if this observation triggers blocked time
+                    self._check_and_add_triggered_blocked_time(obs, task_complete=False)
+                else:
+                    logger.warning(f"    ✗ Could not schedule {obs.obs_id}")
+                    unscheduled.append(obs)
+            
+            # Mark task as complete if all observations scheduled
+            if all(obs not in unscheduled for obs in task_obs):
+                self.completed_tasks.add(task_id)
+
+                # Check if task completion triggers blocked time
+                # Use the last observation of the task as reference
+                if task_obs:
+                    self._check_and_add_triggered_blocked_time(task_obs[-1], task_complete=True)
+
+                logger.info(f"✓ Task {task_id} complete ({task_scheduled}/{len(task_obs)} observations scheduled)")
+            else:
+                failed = len(task_obs) - task_scheduled
+                logger.warning(f"⚠ Task {task_id} partially complete ({task_scheduled}/{len(task_obs)} scheduled, {failed} failed)")
+        
+        return unscheduled
+    
+    def _group_by_task(self, observations: List[Observation]) -> Dict[str, List[Observation]]:
+        """Group observations by task number."""
+        tasks = defaultdict(list)
+        
+        for obs in observations:
+            task_id = obs.task_number or "0000"
+            tasks[task_id].append(obs)
+        
+        return dict(tasks)
+    
+    def _topological_sort(self, task_ids: Set[str]) -> List[str]:
+        """
+        Topological sort of tasks based on dependencies.
+        
+        Uses dependency depth (how many tasks depend on this task) as primary sort key,
+        then numeric/alphabetic ordering as secondary key.
+        
+        Args:
+            task_ids: Set of task IDs to sort
+        
+        Returns:
+            List of task IDs in dependency order
+        """
+        # Build adjacency list and in-degree count
+        in_degree = {task: 0 for task in task_ids}
+        adj_list = defaultdict(list)
+        reverse_deps = defaultdict(set)  # Track what depends on each task
+        
+        for task in task_ids:
+            prereqs = self.dependencies.get(task, [])
+            for prereq in prereqs:
+                if prereq in task_ids:
+                    adj_list[prereq].append(task)
+                    in_degree[task] += 1
+                    reverse_deps[prereq].add(task)
+        
+        # Calculate dependency depth (how many tasks transitively depend on this task)
+        def count_dependents(task_id: str, visited: Set[str] = None) -> int:
+            if visited is None:
+                visited = set()
+            if task_id in visited:
+                return 0
+            visited.add(task_id)
+            
+            count = len(reverse_deps[task_id])
+            for dependent in reverse_deps[task_id]:
+                count += count_dependents(dependent, visited)
+            return count
+        
+        # Kahn's algorithm with priority
+        queue = []
+        for task in task_ids:
+            if in_degree[task] == 0:
+                dep_count = count_dependents(task)
+                queue.append((dep_count, task))
+        
+        # Sort queue by dependency count (descending), then by task ID
+        queue.sort(key=lambda x: (-x[0], x[1]))
+        queue = deque([task for _, task in queue])
+        
+        result = []
+        
+        while queue:
+            task = queue.popleft()
+            result.append(task)
+            
+            # Process dependents
+            next_tasks = []
+            for dependent in adj_list[task]:
+                in_degree[dependent] -= 1
+                if in_degree[dependent] == 0:
+                    dep_count = count_dependents(dependent)
+                    next_tasks.append((dep_count, dependent))
+            
+            # Sort by dependency count (descending), then by task ID
+            next_tasks.sort(key=lambda x: (-x[0], x[1]))
+            
+            # Add to front of queue (higher priority tasks first)
+            for _, next_task in next_tasks:
+                queue.appendleft(next_task)
+        
+        # Check for cycles
+        if len(result) != len(task_ids):
+            logger.warning("Dependency cycle detected, using partial order")
+            remaining = task_ids - set(result)
+            # Sort remaining by dependency count
+            remaining_sorted = sorted(remaining, key=lambda t: (-count_dependents(t), t))
+            result.extend(remaining_sorted)
+        
+        return result
+    
+    def _can_schedule_task(self, task_id: str) -> bool:
+        """Check if task dependencies are satisfied."""
+        prereqs = self.dependencies.get(task_id, [])
+        return all(prereq in self.completed_tasks for prereq in prereqs)
+    
+    def _schedule_single_observation(self, obs: Observation) -> bool: # NEEDS CHANGE
+        """
+        Schedule a single observation.
+        
+        Args:
+            obs: Observation to schedule
+        
+        Returns:
+            True if successfully scheduled, False otherwise
+        """
+        # Log the observation details
+        logger.info(f"  Scheduling observation {obs.obs_id}...")
+        logger.info(f"    Target: {obs.target_name or 'Unknown'}")
+        
+        if obs.duration is not None:
+            logger.info(f"    Requested duration: {obs.duration:.4f} minutes ({obs.duration*60:.1f} seconds)")
+
+        # Special handling for task 0312_000
+        if Task0312Handler.is_task_0312(obs):
+            return self._schedule_task_0312(obs)
+
+        # Check if observation is schedulable
+        constraint_result = self.constraint_checker.check_observation_schedulable(
+            obs, self.current_time
+        )
+
+        # GOOD HERE TO TOP
+
+        if not constraint_result.valid:
+            logger.warning(f"    Constraint check failed:")
+            for msg in constraint_result.messages:
+                logger.warning(f"      - {msg}")
+            return False
+        
+        # Get visibility windows that:
+        # 1. Are after current time
+        # 2. Don't overlap with blocked time
+        available_windows = []
+        for vis_start, vis_end in obs.visibility_windows:
+            if vis_end <= self.current_time:
+                continue
+            
+            # Adjust window start if needed
+            if vis_start < self.current_time:
+                vis_start = self.current_time
+            
+            # Check if window overlaps with blocked time
+            if self._is_time_blocked(vis_start, vis_end):
+                logger.debug(f"    Visibility window {vis_start} to {vis_end} overlaps blocked time, skipping")
+                continue
+            
+            available_windows.append((vis_start, vis_end))
+        
+        if not available_windows:
+            logger.warning(f"    No available visibility windows (may be blocked)")
+            return False
+        
+        logger.info(f"    Found {len(available_windows)} available visibility windows")
+        
+        # GOOD HERE TO BOTTOM
+        # Determine if we need overhead for first sequence
+        needs_initial_overhead = self._needs_slew_overhead(obs)
+        logger.info(f"    Needs overhead: {needs_initial_overhead}")
+
+        # Split observation into sequences
+        sequences = self.constraint_checker.split_observation_into_sequences(
+            obs, available_windows, self.current_time, needs_initial_overhead
+        )
+        
+        if not sequences:
+            logger.warning(f"    Could not split into valid sequences")
+            return False
+        
+        logger.info(f"    Constraint checker returned {len(sequences)} sequence(s)")
+
+        # Log what constraint checker returned
+        for idx, (start, win_end, science_dur) in enumerate(sequences):
+            logger.info(f"      Returned seq {idx+1}: start={start}, science={science_dur:.4f} min")
+        
+        # Create sequences
+        existing_seqs = [s for s in self.scheduled_sequences if s.obs_id == obs.obs_id]
+        seq_num = len(existing_seqs) + 1
+        
+        for seq_idx, (start, window_end, science_duration) in enumerate(sequences):
+            logger.info(f"      Processing sequence {seq_num}:")
+            logger.info(f"        Input science_duration: {science_duration:.4f} min")
+            
+            # Only first sequence has overhead
+            overhead = self.config.slew_overhead_minutes if (seq_idx == 0 and needs_initial_overhead) else 0.0
+            logger.info(f"        Overhead for this sequence: {overhead:.4f} min")
+
+            # Round science duration
+            science_duration_rounded = self._round_duration_to_minute(science_duration)
+            logger.info(f"        Rounded science_duration: {science_duration_rounded:.4f} min")
+            
+            # Total duration
+            total_duration = science_duration_rounded + overhead
+            logger.info(f"        Total duration: {total_duration:.4f} min")
+            
+            sequence_end = start + timedelta(minutes=total_duration)
+            logger.info(f"        Calculated end: {sequence_end}")
+            
+            logger.info(f"      Sequence {seq_num}:")
+            logger.info(f"        Time: {start} to {sequence_end}")
+            logger.info(f"        Science: {science_duration:.1f} min, Overhead: {overhead:.1f} min")
+            
+            seq = ObservationSequence(
+                obs_id=obs.obs_id,
+                sequence_id=f"{seq_num:03d}",
+                start=start,
+                stop=sequence_end,
+                parent_observation=obs,
+                target_name=obs.target_name,
+                boresight_ra=obs.boresight_ra,
+                boresight_dec=obs.boresight_dec,
+                priority=obs.priority,
+                science_duration_minutes=science_duration,
+                nir_duration_minutes=obs.nir_duration,
+                vis_duration_minutes=obs.visible_duration,
+                raw_xml_tree=obs.raw_xml_tree
+            )
+            
+            self._adjust_sequence_camera_parameters(seq, science_duration, obs)
+            self.scheduled_sequences.append(seq)
+            
+            # Update tracking ONLY after first sequence
+            if seq_idx == 0:
+                self.last_ra = obs.boresight_ra
+                self.last_dec = obs.boresight_dec
+            
+            # Update current time to end of this sequence
+            self.current_time = sequence_end
+            
+            seq_num += 1
+            logger.info(f"        ✓ Created sequence {seq.obs_id}_{seq.sequence_id}")
+        
+        self.completed_observations.add(obs.obs_id)
+        return True
+
+    def _find_overlapping_visibility_window( # NEEDS CHANGE
+        self,
+        first_obs: Observation,
+        second_obs: Observation,
+        required_duration: float,
+        allow_truncation: bool = True
+    ) -> Optional[Tuple[datetime, datetime]]:
+        """Find visibility window for paired observations."""
+        best_window = None
+        best_duration = 0.0
+        
+        for win1_start, win1_end in first_obs.visibility_windows:
+            if win1_start < self.current_time:
+                win1_start = self.current_time
+            
+            if win1_start >= win1_end:
+                continue
+            
+            for win2_start, win2_end in second_obs.visibility_windows:
+                # Find overlap
+                overlap_start = max(win1_start, win2_start)
+                overlap_end = min(win1_end, win2_end)
+                
+                if overlap_start >= overlap_end:
+                    continue
+                
+                # Check if not blocked
+                if self._is_time_blocked(overlap_start, overlap_end):
+                    continue
+                
+                overlap_duration = (overlap_end - overlap_start).total_seconds() / 60.0
+                
+                # If truncation allowed, keep track of best window
+                if allow_truncation:
+                    if overlap_duration > best_duration:
+                        best_duration = overlap_duration
+                        best_window = (overlap_start, overlap_end)
+                else:
+                    # Without truncation, need full duration
+                    if overlap_duration >= required_duration:
+                        return (overlap_start, overlap_end)
+        
+        # If allowing truncation, return best window found
+        if allow_truncation and best_window:
+            logger.info(
+                f"      Using truncated window: {best_duration:.1f} min "
+                f"available (needed {required_duration:.1f} min)"
+            )
+            return best_window
+        
+        return None
+    
+    def _create_sequences_for_duration( # NEEDS CHANGE
+        self,
+        obs: Observation,
+        start_time: datetime,
+        end_time: datetime,
+        science_duration: float,
+        needs_overhead: bool
+    ) -> List[ObservationSequence]:
+        """
+        Create observation sequences to fill a time span.
+        
+        Handles splitting if duration exceeds 90 minutes.
+        
+        Args:
+            obs: Observation
+            start_time: Start time
+            end_time: End time
+            science_duration: Total science time to schedule
+            needs_overhead: Whether first sequence needs overhead
+        
+        Returns:
+            List of ObservationSequence objects
+        """
+        sequences = []
+        current_pos = start_time
+        remaining_science = science_duration
+        
+        # Get existing sequence count for this observation
+        existing_seqs = [s for s in self.scheduled_sequences if s.obs_id == obs.obs_id]
+        seq_num = len(existing_seqs) + 1
+        
+        first_sequence = True
+        
+        while remaining_science > 0 and current_pos < end_time:
+            # Determine science duration for this sequence
+            max_science = self.config.max_sequence_duration_minutes
+            
+            # Account for overhead on first sequence
+            if first_sequence and needs_overhead:
+                max_science -= 1.0  # Reserve space for overhead
+            
+            seq_science = min(remaining_science, max_science)
+            
+            # Add overhead to first sequence
+            if first_sequence and needs_overhead:
+                seq_total = seq_science + 1.0
+            else:
+                seq_total = seq_science
+            
+            seq_end = current_pos + timedelta(minutes=seq_total)
+            
+            # Make sure we don't exceed the allocated end time
+            if seq_end > end_time:
+                seq_end = end_time
+                seq_total = (seq_end - current_pos).total_seconds() / 60.0
+                seq_science = seq_total - (1.0 if first_sequence and needs_overhead else 0.0)
+            
+            if seq_science <= 0:
+                break
+            
+            seq = ObservationSequence(
+                obs_id=obs.obs_id,
+                sequence_id=f"{seq_num:03d}",
+                start=current_pos,
+                stop=seq_end,
+                parent_observation=obs,
+                target_name=obs.target_name,
+                boresight_ra=obs.boresight_ra,
+                boresight_dec=obs.boresight_dec,
+                priority=obs.priority,
+                science_duration_minutes=seq_science,
+                nir_duration_minutes=obs.nir_duration,
+                vis_duration_minutes=obs.visible_duration,
+                raw_xml_tree=obs.raw_xml_tree
+            )
+            
+            # Adjust camera parameters
+            if seq_science < obs.duration:
+                # Partial observation - scale parameters
+                scale_factor = seq_science / obs.duration
+                scaled_params = Task0312Handler.calculate_scaled_parameters(obs, scale_factor)
+                seq.metadata['adjusted_params'] = scaled_params
+            else:
+                self._adjust_sequence_camera_parameters(seq, seq_science, obs)
+            
+            sequences.append(seq)
+            
+            current_pos = seq_end
+            remaining_science -= seq_science
+            first_sequence = False
+            seq_num += 1
+        
+        return sequences
+
+    def _needs_slew_overhead(self, obs: Observation) -> bool:
+        """
+        Check if observation needs slew overhead.
+        
+        Returns:
+            True if 1 minute overhead should be included
+        """
+        # Check for no-overhead special constraint
+        if self.special_constraints.requires_no_overhead(obs.obs_id):
+            return False
+        
+        # Check if pointing changed
+        if self.last_ra is None or self.last_dec is None:
+            return True
+        
+        # Check if pointing is same (within small tolerance)
+        if (abs(self.last_ra - (obs.boresight_ra or 0)) < 0.001 and
+            abs(self.last_dec - (obs.boresight_dec or 0)) < 0.001):
+            return False
+        
         return True
     
-    dependencies = dep_map[task_num]
-    return all(dep in completed_tasks for dep in dependencies)
+    def _adjust_sequence_camera_parameters(
+        self,
+        seq: ObservationSequence,
+        science_duration_minutes: float,
+        parent_obs: Observation
+    ):
+        """
+        Adjust camera parameters (frames, integrations) based on actual science duration.
+        
+        This is critical for split observations where a sequence may have less time
+        than the full observation request.
+        
+        Args:
+            seq: ObservationSequence to adjust
+            science_duration_minutes: Actual science time available (after overhead)
+            parent_obs: Parent Observation with original parameters
+        """
+        # Store adjusted parameters in sequence metadata
+        if 'adjusted_params' not in seq.metadata:
+            seq.metadata['adjusted_params'] = {}
+        
+        # Calculate visible camera parameters
+        if parent_obs.num_total_frames_requested and parent_obs.exposure_time_us:
+            # Calculate frame time in seconds
+            frame_time_s = parent_obs.exposure_time_us / 1e6
+            
+            # Calculate how many frames fit in the science duration
+            science_duration_s = science_duration_minutes * 60.0
+            max_frames = int(science_duration_s / frame_time_s)
+            
+            # If there's a FramesPerCoadd requirement, round down to nearest multiple
+            if parent_obs.frames_per_coadd:
+                max_frames = (max_frames // parent_obs.frames_per_coadd) * parent_obs.frames_per_coadd
+            
+            # Don't exceed the original request
+            adjusted_frames = min(max_frames, parent_obs.num_total_frames_requested)
+            
+            seq.metadata['adjusted_params']['NumTotalFramesRequested'] = adjusted_frames
+            
+            logger.debug(
+                f"        Adjusted visible frames: {parent_obs.num_total_frames_requested} -> {adjusted_frames} "
+                f"({science_duration_minutes:.3f} min available)"
+            )
+        
+        # Calculate NIR camera parameters
+        if parent_obs.sc_integrations and parent_obs.roi_sizex and parent_obs.roi_sizey:
+            # Calculate single integration time
+            frame_count_term = (
+                (parent_obs.sc_resets1 or 0) +
+                (parent_obs.sc_resets2 or 0) +
+                (parent_obs.sc_dropframes1 or 0) +
+                (parent_obs.sc_dropframes2 or 0) +
+                (parent_obs.sc_dropframes3 or 0) +
+                (parent_obs.sc_readframes or 0) +
+                1
+            )
+            pixel_term = (parent_obs.roi_sizex * parent_obs.roi_sizey) + (parent_obs.roi_sizey * 12)
+            integration_time_s = frame_count_term * pixel_term * 0.00001
+            
+            # Calculate how many integrations fit in the science duration
+            science_duration_s = science_duration_minutes * 60.0
+            max_integrations = int(science_duration_s / integration_time_s)
+            
+            # Don't exceed the original request
+            adjusted_integrations = min(max_integrations, parent_obs.sc_integrations)
+            
+            seq.metadata['adjusted_params']['SC_Integrations'] = adjusted_integrations
+            
+            logger.debug(
+                f"        Adjusted NIR integrations: {parent_obs.sc_integrations} -> {adjusted_integrations} "
+                f"({science_duration_minutes:.3f} min available)"
+            )
 
-
-# -----------------------------
-# Core merging + scheduling loop
-# -----------------------------
-def merge_schedules(input_paths: List[str], output_path: str,
-                    cvz_coords: Tuple[float, float],
-                    tle_line1: str, tle_line2: str,
-                    commissioning_start: datetime = COMMISSIONING_START,
-                    commissioning_end: datetime = COMMISSIONING_END,
-                    pointing_ephem_file: Optional[str] = None,
-                    dependency_json: Optional[str] = None,
-                    progress_json: Optional[str] = None,
-                    extra_cvz_json: Optional[str] = None,
-                    enable_gap_filling: bool = True) -> Dict:
+    def _fill_cvz_gaps(self):
+        """Fill scheduling gaps with CVZ idle pointings."""
+        logger.info("Analyzing schedule for gaps...")
+        
+        # Find gaps in the schedule
+        gaps = self._find_schedule_gaps()
+        
+        if not gaps:
+            logger.info("No gaps found in schedule")
+        
+        # Try to fill gaps with science observations if enabled
+        if self.config.enable_gap_filling and gaps:
+            logger.info("Attempting to fill gaps with science observations...")
+            gaps = self._try_fill_gaps_with_science(gaps)
+        
+        # Fill blocked time windows with CVZ sequences
+        if self.blocked_time_windows:
+            logger.info(f"Filling {len(self.blocked_time_windows)} blocked time windows with CVZ sequences...")
+            self._fill_blocked_time_with_cvz()
+        
+        # Fill remaining gaps with CVZ pointings
+        if gaps:
+            logger.info("Filling remaining gaps with CVZ idle pointings...")
+            self._fill_gaps_with_cvz(gaps)
     
-    # Ensure all input times are in UTC
-    commissioning_start = ensure_utc_time(commissioning_start)
-    commissioning_end = ensure_utc_time(commissioning_end)
-    extended_end = ensure_utc_time(commissioning_end + EXTENDED_SCHEDULING_PERIOD)
-    
-    obs_list = [parse_task_xml(p) for p in input_paths]
-
-    # Load dependency map
-    dep_map = {}
-    if dependency_json and os.path.exists(dependency_json):
-        with open(dependency_json) as f:
-            dep_map = json.load(f)
-        obs_list = enforce_dependencies(obs_list, dep_map)
-    else:
-        obs_list.sort(key=lambda o: (int(o.visit_id), int(o.obs_id)))
-
-    # Create task mapping: task_num -> list of observations
-    task_to_obs = defaultdict(list)
-    for obs in obs_list:
-        task_match = re.match(r"(\d{4})", obs.filename)
-        if task_match:
-            task_num = task_match.group(1)
-            task_to_obs[task_num].append(obs)
-
-    # Load progress info and track completion properly
-    completed = {}
-    completed_obs_files = set()
-    completed_tasks = set()
-    
-    if progress_json and os.path.exists(progress_json):
-        with open(progress_json) as f:
-            completed = json.load(f)
-
-    # Filter out completed individual observation files
-    obs_list_filtered = []
-    for obs in obs_list:
-        obs_file_key = obs.filename[:8]
-        if obs_file_key in completed and completed[obs_file_key] == "done":
-            completed_obs_files.add(obs_file_key)
+    def _find_schedule_gaps(self) -> List[Tuple[datetime, datetime]]:
+        """
+        Find gaps between scheduled observations.
+        Does NOT include blocked time windows.
+        """
+        # Get all non-blocked, non-CVZ sequences
+        science_sequences = [
+            s for s in self.scheduled_sequences 
+            if s.obs_id not in ["CVZ", "CVZ_BLOCKED"]
+        ]
+        
+        if not science_sequences:
+            # Check if entire schedule is available or blocked
+            gaps = [(self.config.commissioning_start, self.config.commissioning_end)]
         else:
-            obs_list_filtered.append(obs)
-    
-    obs_list = obs_list_filtered
-
-    # Determine which tasks are completely done
-    for task_num, task_obs_list in task_to_obs.items():
-        all_completed = True
-        for obs in task_obs_list:
-            obs_file_key = obs.filename[:8]
-            if obs_file_key not in completed_obs_files:
-                all_completed = False
-                break
-        if all_completed:
-            completed_tasks.add(task_num)
-
-    # Load extra CVZ blocks
-    extra_cvz_blocks = []
-    if extra_cvz_json and os.path.exists(extra_cvz_json):
-        with open(extra_cvz_json) as f:
-            cvz_blocks = json.load(f)
-        for block in cvz_blocks:
-            s = datetime.fromisoformat(block["start"])
-            e = datetime.fromisoformat(block["stop"])
-            extra_cvz_blocks.append((s, e))
-        extra_cvz_blocks.sort(key=lambda x: x[0])
-
-    master_root = ET.Element('ScienceCalendar')
-    if obs_list:
-        meta = obs_list[0].xml_root.find('cal:Meta', namespaces=NS)
-        if meta is not None:
-            master_root.append(meta)
-
-    # Initialize scheduling variables
-    current_time = align_to_minute_boundary(commissioning_start)
-    tle_data = (tle_line1, tle_line2)
-    visit_id = 0
-    visits_written = 0
-    exceeded_commissioning = False
-    
-    # For task 0342 (Moon) timing
-    full_moon_time = ensure_utc_time(FULL_MOON_TIME)
-    moon_task_window = timedelta(days=2)  # Window around full moon
-    skipped_0342_observations = set()  # Track which 0342 observations we've skipped
-
-    # Verify CVZ visibility
-    verify_cvz_visibility(cvz_coords[0], cvz_coords[1], current_time, extended_end, tle_data)
-
-    # Main scheduling loop - process observations in dependency order
-    while True:
-        # Check if we've exceeded commissioning period
-        if current_time > commissioning_end and not exceeded_commissioning:
-            exceeded_commissioning = True
-            print(f"Warning: Scheduling has exceeded commissioning period at {format_utc_time(current_time)}")
-
-        # Handle extra CVZ blocks if scheduled for this time
-        while extra_cvz_blocks and extra_cvz_blocks[0][0] <= current_time:
-            cvz_start, cvz_end = extra_cvz_blocks.pop(0)
-            if cvz_end > current_time:
-                actual_start = max(cvz_start, current_time)
-                cvz_duration = (cvz_end - actual_start).total_seconds()
-                
-                # Split CVZ into 90-minute chunks if needed
-                cvz_segments = split_long_observation_time(cvz_duration, 5400)
-                
-                for segment_duration in cvz_segments:
-                    segment_end = actual_start + timedelta(seconds=segment_duration)
-                    cvz_visit = create_cvz_visit(cvz_coords[0], cvz_coords[1], actual_start, segment_end, visit_id, 1)
-                    master_root.append(cvz_visit)
-                    visit_id += 1
-                    visits_written += 1
-                    actual_start = segment_end
-                
-                current_time = align_to_minute_boundary(cvz_end)
-
-        # Get next schedulable observations
-        schedulable_obs = get_schedulable_observations(obs_list, completed_obs_files, completed_tasks, dep_map)
-        
-        if not schedulable_obs:
-            print("No more schedulable observations - ending schedule")
-            break
-        
-        # Check if we need to process any skipped 0342 observations
-        moon_window_start = full_moon_time - moon_task_window
-        moon_window_end = full_moon_time + moon_task_window
-        near_full_moon = moon_window_start <= current_time <= moon_window_end
-        
-        # Find non-0342 observations first
-        non_moon_obs = []
-        moon_obs = []
-        
-        for obs in schedulable_obs:
-            task_match = re.match(r"(\d{4})", obs.filename)
-            if task_match:
-                task_num = task_match.group(1)
-                obs_file_key = obs.filename[:8]
-                
-                if task_num == "0342":
-                    moon_obs.append(obs)
-                else:
-                    non_moon_obs.append(obs)
-        
-        # Decide which observation to process
-        obs_to_process = None
-        
-        # If we're near full moon, or there are no other tasks, process 0342
-        if (near_full_moon or not non_moon_obs) and moon_obs:
-            obs_to_process = moon_obs[0]
-            print(f"Processing task 0342 (Moon) - near full moon: {near_full_moon}, no other tasks: {not non_moon_obs}")
-        # If we're not near full moon and have other tasks, process non-0342 tasks
-        elif non_moon_obs:
-            obs_to_process = non_moon_obs[0]
-            # Mark any 0342 observations as temporarily skipped (but don't mark them as completed)
-            for moon_ob in moon_obs:
-                obs_file_key = moon_ob.filename[:8]
-                if obs_file_key not in skipped_0342_observations:
-                    skipped_0342_observations.add(obs_file_key)
-                    print(f"Skipping task 0342 observation {moon_ob.filename} until closer to full moon (current: {current_time.strftime('%Y-%m-%d')}, target: {full_moon_time.strftime('%Y-%m-%d')})")
-        # If we only have 0342 observations left and we're not near full moon, process them anyway
-        elif moon_obs:
-            obs_to_process = moon_obs[0]
-            print(f"Processing task 0342 anyway - no other tasks remaining")
-        
-        if not obs_to_process:
-            print("No observations to process - ending schedule")
-            break
-        
-        task_match = re.match(r"(\d{4})", obs_to_process.filename)
-        if not task_match:
-            # Remove this observation and continue
-            obs_file_key = obs_to_process.filename[:8]
-            completed_obs_files.add(obs_file_key)
-            continue
+            science_sequences.sort(key=lambda s: s.start)
+            gaps = []
             
-        task_num = task_match.group(1)
-        obs_file_key = obs_to_process.filename[:8]
-        
-        print(f"Processing task {task_num}: {obs_to_process.filename}, RA: {obs_to_process.ra}, Dec: {obs_to_process.dec}")
-        
-        # Double-check dependencies before processing
-        if not check_dependencies_satisfied(task_num, completed_tasks, dep_map):
-            missing_deps = [d for d in dep_map.get(task_num, []) if d not in completed_tasks]
-            print(f"Task {task_num} dependencies not satisfied: {missing_deps}, cannot schedule yet.")
-            break  # Wait for dependencies to be satisfied
-        
-        # Process different task types
-        success = None
-        
-        if task_num in ["0341", "0342"]:
-            # Cardinal pointing tasks
-            success = process_cardinal_pointing_task(obs_to_process, task_num, current_time, pointing_ephem_file,
-                                                   cvz_coords, master_root, visit_id, tle_line1, tle_line2)
-            if success:
-                visit_id = success
-                visits_written += 1
-                completed_obs_files.add(obs_file_key)
-                
-        elif task_num == "0312":
-            # Special alternating task
-            success = process_task_0312(obs_to_process, current_time, cvz_coords, master_root, visit_id, 
-                                      tle_line1, tle_line2)
-            if success:
-                visit_id, current_time = success
-                visits_written += 1
-                completed_obs_files.add(obs_file_key)
-                
-        else:
-            # Normal task processing
-            success = process_normal_task(obs_to_process, current_time, cvz_coords, master_root, visit_id,
-                                        tle_line1, tle_line2)
-            if success:
-                visit_id, current_time = success
-                visits_written += 1
-                completed_obs_files.add(obs_file_key)
-        
-        if not success:
-            print(f"Failed to schedule {obs_to_process.filename}, marking as completed to avoid infinite loop")
-            completed_obs_files.add(obs_file_key)
-        
-        # Check if task is now complete
-        task_obs_remaining = [o for o in task_to_obs[task_num] 
-                             if o.filename[:8] not in completed_obs_files]
-        if not task_obs_remaining:
-            completed_tasks.add(task_num)
-            print(f"All observations for task {task_num} completed")
-
-    # Update Meta values in the XML
-    meta = master_root.find('cal:Meta', namespaces=NS)
-    if meta is not None:
-        # Find first and last observation times
-        all_start_times = []
-        all_stop_times = []
-        
-        for visit in master_root.findall('.//cal:Visit', namespaces=NS):
-            for obs_seq in visit.findall('.//cal:Observation_Sequence', namespaces=NS):
-                timing = obs_seq.find('.//cal:Timing', namespaces=NS)
-                if timing is not None:
-                    start = timing.find('cal:Start', namespaces=NS)
-                    stop = timing.find('cal:Stop', namespaces=NS)
-                    
-                    if start is not None and start.text:
-                        all_start_times.append(start.text)
-                    
-                    if stop is not None and stop.text:
-                        all_stop_times.append(stop.text)
-        
-        # Update Meta values if we found observation times
-        if all_start_times and all_stop_times:
-            # Use attrib dictionary to update attributes directly
-            meta.attrib['Valid_From'] = min(all_start_times)
-            meta.attrib['Expires'] = max(all_stop_times)
+            # Gap before first sequence
+            if science_sequences[0].start > self.config.commissioning_start:
+                gaps.append((self.config.commissioning_start, science_sequences[0].start))
             
-            # Update Created time to current UTC time
-            now = datetime.now(timezone.utc)
-            meta.attrib['Created'] = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            # Gaps between sequences
+            for i in range(len(science_sequences) - 1):
+                gap_start = science_sequences[i].stop
+                gap_end = science_sequences[i + 1].start
+                gap_duration = (gap_end - gap_start).total_seconds() / 60.0
+                
+                if gap_duration >= 2.0:
+                    gaps.append((gap_start, gap_end))
             
-            # Update Keepout_Angles
-            meta.attrib['Keepout_Angles'] = "90.0, 25.0, 63.0"
-
-    # Write output
-    tree = ET.ElementTree(master_root)
-    indent(tree.getroot(), 0)
-    tree.write(output_path, encoding='unicode', xml_declaration=True)
+            # Gap after last sequence
+            if science_sequences[-1].stop < self.config.commissioning_end:
+                gaps.append((science_sequences[-1].stop, self.config.commissioning_end))
+        
+        # Remove any parts of gaps that overlap with blocked time
+        filtered_gaps = []
+        for gap_start, gap_end in gaps:
+            # Split gap around blocked time windows
+            current_start = gap_start
+            
+            for blocked in sorted(self.blocked_time_windows, key=lambda b: b.start_time):
+                if blocked.start_time >= gap_end or blocked.end_time <= current_start:
+                    continue
+                
+                # Add gap before blocked time
+                if current_start < blocked.start_time:
+                    gap_duration = (blocked.start_time - current_start).total_seconds() / 60.0
+                    if gap_duration >= 2.0:
+                        filtered_gaps.append((current_start, blocked.start_time))
+                
+                # Move start past blocked time
+                current_start = blocked.end_time
+            
+            # Add remaining gap after all blocked times
+            if current_start < gap_end:
+                gap_duration = (gap_end - current_start).total_seconds() / 60.0
+                if gap_duration >= 2.0:
+                    filtered_gaps.append((current_start, gap_end))
+        
+        return filtered_gaps
     
-    return {
-        "visits_written": visits_written,
-        "total_observations": len([obs for obs in obs_list if obs.filename[:8] not in completed_obs_files]),
-        "schedule_end": current_time.isoformat(),
-        "exceeded_commissioning": exceeded_commissioning
-    }
-
-
-# -----------------------------
-# Diagnostic functions
-# -----------------------------
-def analyze_schedule_diagnostics(xml_file_path: str, commissioning_end: datetime, 
-                               input_xml_dir: str, debug=False, detailed_sequences=False) -> Dict:
-    """
-    Analyze the generated schedule XML and provide comprehensive diagnostics
-    
-    Parameters:
-    - xml_file_path: Path to the output XML schedule
-    - commissioning_end: End time of commissioning period
-    - input_xml_dir: Directory containing original task XML files (for task number mapping)
-    - debug: Print debugging information
-    - detailed_sequences: Track and report every observation sequence with duration
-    """
-    import xml.etree.ElementTree as ET
-    from collections import defaultdict, Counter
-    import glob
-    import os
-    
-    # Ensure commissioning_end is timezone-aware (UTC)
-    commissioning_end = ensure_utc_time(commissioning_end)
-    
-    # Build mapping of target names/coordinates to task numbers from input files
-    target_to_task = {}
-    coord_to_task = {}
-    task_info = {}  # Store detailed info about each task
-    
-    if debug:
-        print("Building task mappings from input XML files...")
-    
-    if input_xml_dir and os.path.exists(input_xml_dir):
-        input_files = glob.glob(os.path.join(input_xml_dir, "*.xml"))
-        for file_path in input_files:
-            filename = os.path.basename(file_path)
-            task_match = re.match(r"(\d{4})_", filename)
-            if task_match:
-                task_num = task_match.group(1)
-                try:
-                    tree = ET.parse(file_path)
-                    root = tree.getroot()
+    def _try_fill_gaps_with_science(
+        self,
+        gaps: List[Tuple[datetime, datetime]]
+    ) -> List[Tuple[datetime, datetime]]:
+        """
+        Try to fill gaps with science observations from tasks that are ready.
+        
+        Args:
+            gaps: List of (start, end) gaps
+        
+        Returns:
+            List of remaining unfilled gaps
+        """
+        remaining_gaps = []
+        
+        # Get list of schedulable tasks (dependencies met)
+        schedulable_tasks = [
+            task_id for task_id in self.dependencies.keys()
+            if self._can_schedule_task(task_id)
+        ]
+        
+        if not schedulable_tasks:
+            logger.info("  No schedulable tasks available for gap filling")
+            return gaps
+        
+        logger.info(f"  Checking {len(schedulable_tasks)} schedulable tasks for gap opportunities")
+        
+        # Get all observations from schedulable tasks that haven't been fully scheduled
+        gap_fill_candidates = []
+        for obs in self._all_observations:
+            if obs.task_number in schedulable_tasks:
+                # Check if observation has been scheduled (check in flat sequence list)
+                is_scheduled = any(
+                    seq.obs_id == obs.obs_id 
+                    for seq in self.scheduled_sequences
+                    if seq.obs_id not in ["CVZ", "CVZ_BLOCKED"]
+                )
+                
+                if not is_scheduled:
+                    gap_fill_candidates.append(obs)
+        
+        if not gap_fill_candidates:
+            logger.info("  No unscheduled observations available for gap filling")
+            return gaps
+        
+        logger.info(f"  Found {len(gap_fill_candidates)} candidate observations for gap filling")
+        
+        filled_count = 0
+        for gap_start, gap_end in gaps:
+            gap_duration = (gap_end - gap_start).total_seconds() / 60.0
+            
+            # Skip very short gaps
+            if gap_duration < 2.0:
+                remaining_gaps.append((gap_start, gap_end))
+                continue
+            
+            # Try to find an observation that's visible during this gap
+            filled = False
+            for obs in gap_fill_candidates:
+                # Check if observation is visible during this gap
+                obs_visible_in_gap = False
+                best_overlap_duration = 0.0
+                
+                for vis_start, vis_end in obs.visibility_windows:
+                    overlap_start = max(gap_start, vis_start)
+                    overlap_end = min(gap_end, vis_end)
+                    if overlap_start < overlap_end:
+                        overlap_duration = (overlap_end - overlap_start).total_seconds() / 60.0
+                        if overlap_duration >= 2.0:
+                            obs_visible_in_gap = True
+                            best_overlap_duration = max(best_overlap_duration, overlap_duration)
+                
+                if obs_visible_in_gap:
+                    logger.info(f"    Found {obs.obs_id} visible in gap ({best_overlap_duration:.1f} min overlap)")
                     
-                    # Get target name
-                    target_elem = root.find('.//cal:Observational_Parameters/cal:Target', namespaces=NS)
-                    target_name = target_elem.text if target_elem is not None and target_elem.text else None
+                    # Try to schedule this observation in the gap
+                    gap_windows = [(gap_start, gap_end)]
+                    sequences = self.constraint_checker.split_observation_into_sequences(
+                        obs, gap_windows, gap_start
+                    )
                     
-                    # Get coordinates
-                    ra_elem = root.find('.//cal:Observational_Parameters/cal:Boresight/cal:RA', namespaces=NS)
-                    dec_elem = root.find('.//cal:Observational_Parameters/cal:Boresight/cal:DEC', namespaces=NS)
-                    
-                    ra = None
-                    dec = None
-                    if ra_elem is not None and dec_elem is not None:
-                        try:
-                            ra_text = ra_elem.text.strip().split()[0] if ra_elem.text else '0'
-                            dec_text = dec_elem.text.strip().split()[0] if dec_elem.text else '0'
-                            ra = float(ra_text)
-                            dec = float(dec_text)
-                        except (ValueError, IndexError):
-                            if debug:
-                                print(f"  Warning: Could not parse coordinates from {filename}")
-                    
-                    # Store mappings
-                    if target_name:
-                        target_to_task[target_name] = task_num
-                        if debug:
-                            print(f"  Task {task_num}: Target '{target_name}' at RA={ra}, DEC={dec}")
-                    
-                    if ra is not None and dec is not None:
-                        coord_to_task[(ra, dec)] = task_num
-                    
-                    # Store comprehensive task info
-                    task_info[task_num] = {
-                        'filename': filename,
-                        'target': target_name,
-                        'ra': ra,
-                        'dec': dec
-                    }
+                    if sequences:
+                        # Determine sequence number for this observation
+                        existing_seqs = [s for s in self.scheduled_sequences if s.obs_id == obs.obs_id]
+                        seq_num = len(existing_seqs) + 1
+                        
+                        for start, end, science_duration in sequences:
+                            # Check overhead
+                            needs_overhead = self._needs_slew_overhead(obs)
+                            overhead_minutes = self.config.slew_overhead_minutes if needs_overhead else 0.0
                             
-                except Exception as e:
-                    print(f"Error reading input file {filename}: {e}")
-    
-    if debug:
-        print(f"\nBuilt mappings for {len(target_to_task)} targets and {len(coord_to_task)} coordinate pairs")
-        print("Target to Task mapping:")
-        for target, task in sorted(target_to_task.items()):
-            print(f"  '{target}' -> Task {task}")
-    
-    # Initialize diagnostics
-    diagnostics = {
-        'task_durations': defaultdict(float),  # commissioning task_num -> total_seconds
-        'target_info': {},  # (ra, dec) -> {'name': target_name, 'duration': seconds, 'task': task_num}
-        'cvz_time': 0.0,
-        'total_schedule_time': 0.0,
-        'time_beyond_commissioning': 0.0,
-        'unscheduled_tasks': [],
-        'visibility_issues': [],
-        'observation_counts': Counter(),  # commissioning task_num -> count
-        'visit_timeline': [],
-        'data_collection_efficiency': {},
-        'target_observations': defaultdict(list),  # target_name -> list of observations
-        'scheduling_order': [],  # Track scheduling order
-        'task_info': task_info,  # Include task info for debugging
-        'matching_issues': [],  # Track targets that couldn't be matched
-        'detailed_sequences': [] if detailed_sequences else None  # All observation sequences in order
-    }
-    
-    # Define expected commissioning tasks
-    expected_tasks = {
-        "0310", "0312", "0315", "0317", "0318", "0319", "0320",
-        "0330", "0341", "0342", "0343", "0350", "0355", "0360"
-    }
-    
-    # Parse the output XML file
-    tree = ET.parse(xml_file_path)
-    root = tree.getroot()
-    visits = root.findall('.//cal:Visit', namespaces=NS)
-    
-    if debug:
-        print(f"\nAnalyzing {len(visits)} visits in output XML...")
-    
-    sequence_counter = 0  # Counter for all observation sequences
-    
-    for visit in visits:
-        visit_id = visit.find('cal:ID', namespaces=NS).text
+                            science_duration = self._round_duration_to_minute(science_duration)
+                            total_duration = science_duration + overhead_minutes
+                            actual_end = start + timedelta(minutes=total_duration)
+                            
+                            # Make sure it fits in gap
+                            if actual_end > gap_end:
+                                science_duration = (gap_end - start).total_seconds() / 60.0 - overhead_minutes
+                                if science_duration < 1.0:
+                                    continue
+                                actual_end = gap_end
+                            
+                            seq = ObservationSequence(
+                                obs_id=obs.obs_id,
+                                sequence_id=f"{seq_num:03d}",
+                                start=start,
+                                stop=actual_end,
+                                parent_observation=obs,
+                                target_name=obs.target_name,
+                                boresight_ra=obs.boresight_ra,
+                                boresight_dec=obs.boresight_dec,
+                                priority=obs.priority,
+                                science_duration_minutes=science_duration,
+                                nir_duration_minutes=obs.nir_duration,
+                                vis_duration_minutes=obs.visible_duration,
+                                raw_xml_tree=obs.raw_xml_tree
+                            )
+                            
+                            self._adjust_sequence_camera_parameters(seq, science_duration, obs)
+                            
+                            # Add to flat sequence list
+                            self.scheduled_sequences.append(seq)
+                            seq_num += 1
+                            
+                            self.last_ra = obs.boresight_ra
+                            self.last_dec = obs.boresight_dec
+                            
+                            logger.info(f"      ✓ Scheduled {obs.obs_id} in gap: {start} to {actual_end} ({science_duration:.1f} min science)")
+                            filled = True
+                            filled_count += 1
+                            
+                            # Update gap
+                            if actual_end < gap_end:
+                                remaining_duration = (gap_end - actual_end).total_seconds() / 60.0
+                                if remaining_duration >= 2.0:
+                                    remaining_gaps.append((actual_end, gap_end))
+                            
+                            break  # Only one sequence per attempt
+                    
+                    if filled:
+                        # Remove this observation from candidates
+                        gap_fill_candidates.remove(obs)
+                        break
+            
+            if not filled:
+                remaining_gaps.append((gap_start, gap_end))
         
-        # Handle multiple observation sequences within a visit
-        obs_sequences = visit.findall('cal:Observation_Sequence', namespaces=NS)
+        if filled_count > 0:
+            logger.info(f"  ✓ Filled {filled_count} gaps with science observations")
         
-        for obs_seq in obs_sequences:
-            sequence_counter += 1
-            obs_seq_id = obs_seq.find('cal:ID', namespaces=NS).text if obs_seq.find('cal:ID', namespaces=NS) is not None else "001"
+        return remaining_gaps
+    
+    def _fill_gaps_with_cvz(self, gaps: List[Tuple[datetime, datetime]]):
+        """Fill gaps with CVZ idle pointings."""
+        if not gaps:
+            return
+        
+        logger.info(f"Filling {len(gaps)} gaps with CVZ idle pointings...")
+        
+        skip_visibility = not self.config.verify_cvz_visibility
+        
+        for gap_idx, (gap_start, gap_end) in enumerate(gaps):
+            gap_duration = (gap_end - gap_start).total_seconds() / 60.0
             
-            # Get timing
-            timing = obs_seq.find('.//cal:Timing', namespaces=NS)
-            start_str = timing.find('cal:Start', namespaces=NS).text
-            stop_str = timing.find('cal:Stop', namespaces=NS).text
+            # Find CVZ pointing
+            midpoint = gap_start + (gap_end - gap_start) / 2
+            antisolar_ra, dec = compute_antisolar_coordinates(Time(midpoint), self.config.cvz_coords[1])
             
-            # Parse times and ensure they're timezone-aware
-            start_time = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
-            stop_time = datetime.fromisoformat(stop_str.replace('Z', '+00:00'))
-            
-            # Convert to UTC timezone-aware datetimes
-            start_time = ensure_utc_time(start_time)
-            stop_time = ensure_utc_time(stop_time)
-            
-            duration = (stop_time - start_time).total_seconds()
-            
-            # Get target info
-            target_element = obs_seq.find('.//cal:Target', namespaces=NS)
-            target = target_element.text if target_element is not None else 'Unknown'
-            
-            # Get coordinates
-            boresight = obs_seq.find('.//cal:Boresight', namespaces=NS)
-            ra = None
-            dec = None
-            if boresight is not None:
-                ra_elem = boresight.find('cal:RA', namespaces=NS)
-                dec_elem = boresight.find('cal:DEC', namespaces=NS)
-                if ra_elem is not None and dec_elem is not None:
-                    ra_text = ra_elem.text.replace(' deg', '') if ra_elem.text else '0'
-                    dec_text = dec_elem.text.replace(' deg', '') if dec_elem.text else '0'
-                    try:
-                        ra = float(ra_text)
-                        dec = float(dec_text)
-                    except ValueError:
-                        ra = 0.0
-                        dec = 0.0
-            
-            # Determine commissioning task number
-            task_num = None
-            match_method = None
-            
-            # First try exact target name match
-            if target in target_to_task:
-                task_num = target_to_task[target]
-                match_method = "exact_target_name"
-            
-            # Then try coordinate matching
-            elif ra is not None and dec is not None:
-                # Look for exact coordinate match
-                coord_key = (ra, dec)
-                if coord_key in coord_to_task:
-                    task_num = coord_to_task[coord_key]
-                    match_method = "exact_coordinates"
+            if skip_visibility:
+                ra, dec = antisolar_ra, dec
+            else:
+                coords = find_visible_cvz_pointing(
+                    self.vis_calc,
+                    Time(gap_start),
+                    Time(gap_end),
+                    self.config.cvz_coords[1],
+                    skip_visibility_check=False
+                )
+                if coords:
+                    ra, dec = coords
                 else:
-                    # Look for close coordinate match (within small tolerance)
-                    for (input_ra, input_dec), input_task in coord_to_task.items():
-                        if abs(ra - input_ra) < 0.001 and abs(dec - input_dec) < 0.001:
-                            task_num = input_task
-                            match_method = "approximate_coordinates"
-                            break
+                    ra, dec = antisolar_ra, dec
             
-            # Special handling for known task patterns
-            if not task_num:
-                if target == 'CVZ_IDLE':
-                    task_num = None
-                    match_method = "cvz"
-                elif "Cardinal_" in target:
-                    # For cardinal pointings, extract base target or use pattern matching
-                    base_target = target.split('_Cardinal_')[0]
-                    if base_target in target_to_task:
-                        base_task = target_to_task[base_target]
-                        if base_task in ["0341", "0342"]:
-                            task_num = base_task
-                            match_method = "cardinal_base_target"
+            # Split into chunks
+            cvz_chunks = self._split_cvz_gap(gap_start, gap_end)
+            
+            logger.info(f"  Gap {gap_idx + 1}: {gap_start} to {gap_end} ({gap_duration:.1f} min)")
+            logger.info(f"    CVZ pointing at RA={ra:.2f}, DEC={dec:.2f}, {len(cvz_chunks)} chunk(s)")
+            
+            for chunk_idx, (chunk_start, chunk_end) in enumerate(cvz_chunks, 1):
+                chunk_duration = (chunk_end - chunk_start).total_seconds() / 60.0
+                
+                seq = ObservationSequence(
+                    obs_id="CVZ",
+                    sequence_id=f"{chunk_idx:03d}",
+                    start=chunk_start,
+                    stop=chunk_end,
+                    target_name="CVZ",
+                    boresight_ra=ra,
+                    boresight_dec=dec,
+                    priority=0,
+                    science_duration_minutes=chunk_duration
+                )
+                
+                seq.metadata['needs_vis_block'] = True
+                
+                # Add to flat sequence list
+                self.scheduled_sequences.append(seq)
+                
+                logger.debug(f"      Added CVZ sequence: {chunk_start} to {chunk_end}")
+
+    def _get_scheduled_duration(self, obs: Observation) -> float:
+        """Get total duration already scheduled for an observation."""
+        total = 0.0
+        visit_id = obs.task_number or obs.obs_id.split('_')[0]
+        visit = self.visits.get(visit_id)
+        
+        if visit:
+            for seq in visit.observation_sequences:
+                if seq.obs_id == obs.obs_id:
+                    total += seq.science_duration_minutes or seq.duration_minutes
+        
+        return total
+
+    def _round_duration_to_minute(self, duration_minutes: float) -> float:
+        """
+        Round duration to nearest minute for short observations.
+        
+        Args:
+            duration_minutes: Duration in minutes
+        
+        Returns:
+            Rounded duration in minutes
+        """
+        import math
+        
+        # If duration is less than 1 minute, round up to 1 minute
+        if duration_minutes < 1.0:
+            return 1.0
+        
+        # If duration has fractional seconds, round up to next minute
+        if duration_minutes != int(duration_minutes):
+            return math.ceil(duration_minutes)
+        
+        return duration_minutes
+
+    def _split_cvz_gap(
+        self,
+        start: datetime,
+        end: datetime,
+        max_chunk_minutes: float = 90.0
+    ) -> List[Tuple[datetime, datetime]]:
+        """Split CVZ gap into chunks of maximum duration."""
+        chunks = []
+        current = start
+        
+        while current < end:
+            remaining = (end - current).total_seconds() / 60.0
+            chunk_duration = min(remaining, max_chunk_minutes)
+            chunk_end = current + timedelta(minutes=chunk_duration)
+            chunks.append((current, chunk_end))
+            current = chunk_end
+        
+        return chunks
+    
+    def _generate_metadata(self) -> Dict[str, Any]:
+        """Generate metadata for output XML."""
+        # Find actual start and end times from scheduled sequences
+        if self.scheduled_sequences:
+            actual_start = min(seq.start for seq in self.scheduled_sequences)
+            actual_end = max(seq.stop for seq in self.scheduled_sequences)
+        else:
+            actual_start = self.config.commissioning_start
+            actual_end = self.config.commissioning_end
+        
+        return {
+            'Valid_From': format_utc_time(actual_start),
+            'Expires': format_utc_time(actual_end),
+            'Created': format_utc_time(datetime.now()),
+            'Keepout_Angles': '91.0, 25.0, 63.0',
+            'Delivery_Id': ''
+        }
+    
+    def _generate_result(
+        self,
+        sequences: List[ObservationSequence],
+        unscheduled: List[Observation]
+    ) -> SchedulingResult:
+        """Generate final scheduling result."""
+        
+        # Calculate metrics from sequences
+        science_sequences = [s for s in sequences if s.obs_id not in ["CVZ", "CVZ_BLOCKED"]]
+        
+        total_science = sum(
+            seq.science_duration_minutes or seq.duration_minutes 
+            for seq in science_sequences
+        )
+        
+        total_duration = sum(seq.duration_minutes for seq in sequences)
+        
+        # Estimate data volume
+        total_data_volume = 0.0
+        for seq in science_sequences:
+            volume = compute_data_volume_gb(
+                nir_minutes=seq.nir_duration_minutes or 0.0,
+                vis_minutes=seq.vis_duration_minutes or 0.0,
+                nir_rate_mbps=self.config.nir_data_rate_mbps,
+                vis_rate_mbps=self.config.vis_data_rate_mbps
+            )
+            total_data_volume += volume
+        
+        # Note: visits will be created during XML writing, so we don't have them here
+        result = SchedulingResult(
+            success=len(unscheduled) == 0,
+            message=f"Scheduled {len(sequences)} sequences",
+            visits=[],  # Will be populated by XML writer
+            total_duration_minutes=total_duration,
+            total_science_minutes=total_science,
+            total_data_volume_gb=total_data_volume,
+            unscheduled_observations=unscheduled
+        )
+        
+        if unscheduled:
+            result.warnings.append(f"{len(unscheduled)} observations could not be scheduled")
+        
+        return result
+
+    def _parse_blocked_time_constraint(self, bt_def: Dict) -> BlockedTimeConstraint:
+        """Parse a blocked time constraint definition."""
+        constraint_type = bt_def.get('type')
+        window_type = bt_def.get('window_type', 'blocked')
+        description = bt_def.get('description', '')
+        
+        if constraint_type == 'fixed':
+            start = parse_utc_time(bt_def['start'])
+            end = parse_utc_time(bt_def['end'])
+            return BlockedTimeConstraint(
+                constraint_type=constraint_type,
+                window_type=window_type,
+                description=description,
+                start=start,
+                end=end
+            )
+        elif constraint_type == 'after_task':
+            return BlockedTimeConstraint(
+                constraint_type=constraint_type,
+                window_type=window_type,
+                description=description,
+                task_id=bt_def['task_id'],
+                duration_minutes=float(bt_def['duration_minutes'])
+            )
+        elif constraint_type == 'after_observation':
+            return BlockedTimeConstraint(
+                constraint_type=constraint_type,
+                window_type=window_type,
+                description=description,
+                observation_id=bt_def['observation_id'],
+                duration_minutes=float(bt_def['duration_minutes'])
+            )
+        else:
+            raise ValueError(f"Unknown blocked time constraint type: {constraint_type}")
+        
+    def _schedule_fixed_blocked_time(self):
+        """Schedule all fixed blocked time windows."""
+        fixed_constraints = [bt for bt in self.blocked_time_constraints if bt.constraint_type == "fixed"]
+        
+        for constraint in fixed_constraints:
+            window = BlockedTimeWindow(
+                window_type=constraint.window_type,
+                start_time=constraint.start,
+                end_time=constraint.end,
+                description=constraint.description
+            )
+            
+            self.blocked_time_windows.append(window)
+            
+            # Update current_time if this blocked time is in the future
+            if constraint.start > self.current_time:
+                logger.info(f"  Scheduled fixed blocked time: {constraint.start} to {constraint.end}")
+            
+            logger.debug(f"  Added fixed blocked time: {window.duration_minutes:.1f} minutes")
+    
+    def _check_and_add_triggered_blocked_time(self, obs: Observation, task_complete: bool = False):
+        """
+        Check if an observation or task completion triggers blocked time.
+        
+        Args:
+            obs: Observation that just completed
+            task_complete: True if the entire task is complete
+        """
+        # Check for observation-triggered constraints
+        obs_constraints = [
+            bt for bt in self.blocked_time_constraints 
+            if bt.constraint_type == "after_observation" and bt.observation_id == obs.obs_id
+        ]
+        
+        for constraint in obs_constraints:
+            start_time = self.current_time
+            end_time = start_time + timedelta(minutes=constraint.duration_minutes)
+            
+            window = BlockedTimeWindow(
+                window_type=constraint.window_type,
+                start_time=start_time,
+                end_time=end_time,
+                description=constraint.description,
+                trigger_obs_id=obs.obs_id
+            )
+            
+            self.blocked_time_windows.append(window)
+            
+            # Advance current_time past the blocked window
+            self.current_time = end_time
+            
+            logger.info(f"  Added blocked time after {obs.obs_id}: {start_time} to {end_time} ({constraint.duration_minutes} min)")
+        
+        # Check for task-triggered constraints if task is complete
+        if task_complete and obs.task_number:
+            task_constraints = [
+                bt for bt in self.blocked_time_constraints 
+                if bt.constraint_type == "after_task" and bt.task_id == obs.task_number
+            ]
+            
+            for constraint in task_constraints:
+                start_time = self.current_time
+                end_time = start_time + timedelta(minutes=constraint.duration_minutes)
+                
+                window = BlockedTimeWindow(
+                    window_type=constraint.window_type,
+                    start_time=start_time,
+                    end_time=end_time,
+                    description=constraint.description,
+                    trigger_task_id=obs.task_number
+                )
+                
+                self.blocked_time_windows.append(window)
+                
+                # Advance current_time past the blocked window
+                self.current_time = end_time
+                
+                logger.info(f"  Added blocked time after task {obs.task_number}: {start_time} to {end_time} ({constraint.duration_minutes} min)")
+
+    def _is_time_available(self, start_time: datetime, end_time: datetime) -> bool:
+        """
+        Check if a time range is available (not blocked and not already scheduled).
+        
+        Args:
+            start_time: Start of time range
+            end_time: End of time range
+        
+        Returns:
+            True if time range is available for scheduling
+        """
+        # Check against blocked time windows
+        for blocked in self.blocked_time_windows:
+            # Check for ANY overlap
+            if start_time < blocked.end_time and end_time > blocked.start_time:
+                logger.debug(f"Time {start_time} to {end_time} overlaps with blocked time")
+                return False
+        
+        # Check against already scheduled sequences
+        for seq in self.scheduled_sequences:
+            if start_time < seq.stop and end_time > seq.start:
+                logger.debug(f"Time {start_time} to {end_time} overlaps with {seq.obs_id}_{seq.sequence_id}")
+                return False
+        
+        return True
+
+    def _is_time_blocked(self, start_time: datetime, end_time: datetime) -> bool:
+        """Check if time range overlaps any blocked time window."""
+        for blocked in self.blocked_time_windows:
+            if start_time < blocked.end_time and end_time > blocked.start_time:
+                return True
+        return False
+
+    def _fill_blocked_time_with_cvz(self):
+        """Fill blocked time windows with CVZ observation sequences."""
+        for blocked_idx, blocked_window in enumerate(self.blocked_time_windows):
+            # Split into 90-minute chunks first
+            cvz_chunks = self._split_cvz_gap(blocked_window.start_time, blocked_window.end_time)
+            
+            logger.info(f"  Blocked time {blocked_idx + 1} ({blocked_window.window_type}): {blocked_window.start_time} to {blocked_window.end_time}")
+            logger.info(f"    Creating {len(cvz_chunks)} CVZ sequences with dynamic pointing")
+            
+            skip_visibility = not self.config.verify_cvz_visibility
+            
+            for chunk_idx, (chunk_start, chunk_end) in enumerate(cvz_chunks, 1):
+                chunk_duration = (chunk_end - chunk_start).total_seconds() / 60.0
+                
+                # Calculate pointing for THIS chunk (not the whole blocked window)
+                chunk_midpoint = chunk_start + (chunk_end - chunk_start) / 2
+                antisolar_ra, dec = compute_antisolar_coordinates(Time(chunk_midpoint), self.config.cvz_coords[1])
+                
+                if skip_visibility:
+                    ra, dec = antisolar_ra, dec
+                else:
+                    coords = find_visible_cvz_pointing(
+                        self.vis_calc,
+                        Time(chunk_start),
+                        Time(chunk_end),
+                        self.config.cvz_coords[1],
+                        skip_visibility_check=False
+                    )
+                    if coords:
+                        ra, dec = coords
                     else:
-                        # Try to determine from visit ID or other patterns
-                        if "0341" in visit_id or "Earth" in target:
-                            task_num = "0341"
-                            match_method = "cardinal_pattern_earth"
-                        elif "0342" in visit_id or "Moon" in target:
-                            task_num = "0342"
-                            match_method = "cardinal_pattern_moon"
-            
-            # Debug output for problematic cases
-            if debug and task_num is None and target != 'CVZ_IDLE':
-                print(f"  Could not match: Visit {visit_id}, Target '{target}', RA={ra}, DEC={dec}")
-                diagnostics['matching_issues'].append({
-                    'visit_id': visit_id,
-                    'obs_seq_id': obs_seq_id,
-                    'target': target,
-                    'ra': ra,
-                    'dec': dec
-                })
-            elif debug and task_num:
-                print(f"  Matched: Visit {visit_id}, Target '{target}' -> Task {task_num} ({match_method})")
-            
-            # Record detailed sequence information if requested
-            if detailed_sequences:
-                diagnostics['detailed_sequences'].append({
-                    'sequence_number': sequence_counter,
-                    'visit_id': visit_id,
-                    'obs_seq_id': obs_seq_id,
-                    'task': task_num if task_num else 'CVZ',
-                    'target': target,
-                    'duration_minutes': duration / 60.0,
-                    'start_time': start_time,
-                    'stop_time': stop_time,
-                    'ra': ra,
-                    'dec': dec,
-                    'match_method': match_method
-                })
-            
-            # Record time for the appropriate category
-            if target == 'CVZ_IDLE':
-                diagnostics['cvz_time'] += duration
-            elif task_num:
-                diagnostics['task_durations'][task_num] += duration
-                diagnostics['observation_counts'][task_num] += 1
+                        ra, dec = antisolar_ra, dec
                 
-                # Add to scheduling order
-                diagnostics['scheduling_order'].append({
-                    'task': task_num,
-                    'duration': duration,
-                    'start_time': start_time,
-                    'target': target,
-                    'visit_id': visit_id,
-                    'obs_seq_id': obs_seq_id,
-                    'match_method': match_method
-                })
-            
-            # Record target info
-            if ra is not None and dec is not None:
-                target_key = (ra, dec)
-                if target_key not in diagnostics['target_info']:
-                    diagnostics['target_info'][target_key] = {
-                        'name': target,
-                        'duration': 0.0,
-                        'task': task_num
-                    }
-                diagnostics['target_info'][target_key]['duration'] += duration
+                seq = ObservationSequence(
+                    obs_id="CVZ_BLOCKED",
+                    sequence_id=f"{chunk_idx:03d}",
+                    start=chunk_start,
+                    stop=chunk_end,
+                    target_name=f"CVZ_{blocked_window.window_type}",
+                    boresight_ra=ra,
+                    boresight_dec=dec,
+                    priority=0,
+                    science_duration_minutes=chunk_duration
+                )
                 
-                # Also track observations by target name
-                diagnostics['target_observations'][target].append({
-                    'start': start_time,
-                    'stop': stop_time,
-                    'duration': duration,
-                    'ra': ra,
-                    'dec': dec,
-                    'task': task_num
-                })
-            
-            # Track timeline
-            diagnostics['visit_timeline'].append({
-                'visit_id': visit_id,
-                'obs_seq_id': obs_seq_id,
-                'start': start_time,
-                'stop': stop_time,
-                'duration': duration,
-                'target': target,
-                'task': task_num,
-                'coords': (ra, dec) if ra is not None and dec is not None else None
-            })
-            
-            # Check if beyond commissioning period
-            if start_time > commissioning_end:
-                diagnostics['time_beyond_commissioning'] += duration
-    
-    # Calculate total schedule time
-    if diagnostics['visit_timeline']:
-        first_start = min(v['start'] for v in diagnostics['visit_timeline'])
-        last_stop = max(v['stop'] for v in diagnostics['visit_timeline'])
-        diagnostics['total_schedule_time'] = (last_stop - first_start).total_seconds()
-        diagnostics['schedule_start_time'] = first_start
-        diagnostics['schedule_end_time'] = last_stop
+                seq.metadata['needs_vis_block'] = True
+                seq.metadata['blocked_type'] = blocked_window.window_type
+                seq.metadata['blocked_description'] = blocked_window.description
+                
+                self.scheduled_sequences.append(seq)
+                
+                logger.debug(f"      Chunk {chunk_idx}: {chunk_start} to {chunk_end}, RA={ra:.2f}")
+
+    def _schedule_task_0312(self, obs: Observation) -> bool:
+        """
+        Special scheduling for task 0312_000.
         
-        # Calculate observation efficiency
-        total_task_time = sum(diagnostics['task_durations'].values())
-        diagnostics['task_observation_efficiency'] = total_task_time / diagnostics['total_schedule_time']
+        Creates 14 consecutive sequences following the specific pattern.
+        
+        Args:
+            obs: Observation object for 0312_000
+        
+        Returns:
+            True if successfully scheduled
+        """
+        logger.info(f"    Using special Task 0312 scheduling pattern")
+        
+        # Check if we have enough contiguous time
+        required_minutes = 101.0  # 100 minutes + 1 minute overhead
+        
+        # Find a visibility window that can accommodate all 101 minutes
+        suitable_window = None
+        for vis_start, vis_end in obs.visibility_windows:
+            if vis_start < self.current_time:
+                vis_start = self.current_time
+            
+            if vis_start >= vis_end:
+                continue
+            
+            # Check if window is large enough
+            available_minutes = (vis_end - vis_start).total_seconds() / 60.0
+            
+            # Check if this time range is not blocked
+            test_end = vis_start + timedelta(minutes=required_minutes)
+            if not self._is_time_blocked(vis_start, test_end):
+                if available_minutes >= required_minutes:
+                    suitable_window = (vis_start, vis_end)
+                    break
+        
+        if not suitable_window:
+            logger.warning(f"    No visibility window can accommodate 101 minutes for 0312_000")
+            return False
+        
+        win_start, win_end = suitable_window
+        logger.info(f"    Found suitable window: {win_start} to {win_end}")
+        
+        # Determine if we need overhead
+        needs_overhead = self._needs_slew_overhead(obs)
+        
+        # Create the 14 sequences
+        task_sequences = Task0312Handler.create_sequences(obs, win_start, needs_overhead)
+        
+        logger.info(f"    Creating {len(task_sequences)} sequences for 0312 pattern")
+        
+        # Calculate scaled parameters for data sequences (5 min / 100 min = 0.05)
+        scaled_params = Task0312Handler.calculate_scaled_parameters(obs, 0.05)
+        
+        logger.info(f"    Scaled parameters: {scaled_params}")
+        
+        for idx, (seq_start, seq_end, science_duration, seq_type) in enumerate(task_sequences, 1):
+            seq = ObservationSequence(
+                obs_id=obs.obs_id,
+                sequence_id=f"{idx:03d}",
+                start=seq_start,
+                stop=seq_end,
+                parent_observation=obs,
+                target_name=obs.target_name,
+                boresight_ra=obs.boresight_ra,
+                boresight_dec=obs.boresight_dec,
+                priority=obs.priority,
+                science_duration_minutes=science_duration,
+                nir_duration_minutes=obs.nir_duration if seq_type == 'data' else None,
+                vis_duration_minutes=obs.visible_duration if seq_type == 'data' else None,
+                raw_xml_tree=obs.raw_xml_tree if seq_type == 'data' else None
+            )
+            
+            # Store sequence type in metadata
+            seq.metadata['task_0312_type'] = seq_type
+            
+            if seq_type == 'data':
+                # Apply scaled parameters for data collection sequences
+                seq.metadata['adjusted_params'] = scaled_params.copy()
+            else:
+                # Staring sequence - needs visible camera block only
+                seq.metadata['needs_vis_block'] = True
+                seq.metadata['is_staring'] = True
+            
+            self.scheduled_sequences.append(seq)
+            
+            logger.info(f"      Seq {idx}: {seq_start} to {seq_end} ({science_duration:.0f} min {seq_type})")
+        
+        # Update tracking
+        final_end = task_sequences[-1][1]  # End time of last sequence
+        self.current_time = final_end
+        self.last_ra = obs.boresight_ra
+        self.last_dec = obs.boresight_dec
+        
+        # Mark observation as complete
+        self.completed_observations.add(obs.obs_id)
+        
+        logger.info(f"    ✓ Completed 0312_000 special scheduling (101 minutes total)")
+        
+        return True
     
-    # Identify unscheduled tasks
-    observed_tasks = set(diagnostics['task_durations'].keys())
-    diagnostics['unscheduled_tasks'] = [task for task in expected_tasks if task not in observed_tasks]
-    
-    return diagnostics
+    def _validate_sequence_scheduling(self, start: datetime, end: datetime) -> bool: # LIKELY REMOVAL
+        """
+        Validate that a sequence can be scheduled in this time range.
+        
+        Args:
+            start: Proposed start time
+            end: Proposed end time
+        
+        Returns:
+            True if time slot is available, False if conflicts exist
+        """
+        # Check for blocked time
+        if self._is_time_blocked(start, end):
+            logger.warning(f"      Time slot {start} to {end} overlaps with blocked time")
+            return False
+            
+        # Check for overlap with existing sequences
+        for seq in self.scheduled_sequences:
+            if (seq.start < end and seq.stop > start):
+                logger.warning(
+                    f"      Time slot {start} to {end} overlaps with "
+                    f"existing sequence {seq.obs_id}_{seq.sequence_id}"
+                )
+                return False
+        
+        return True
+
+    def _scale_camera_parameters(self, obs: Observation, scale_factor: float) -> dict:
+        """
+        Scale camera parameters (exposure counts) proportionally.
+        
+        Args:
+            obs: Observation being scaled
+            scale_factor: Fraction to scale by (e.g., 0.5 for half duration)
+        
+        Returns:
+            Dictionary of scaled parameters
+        """
+        scaled = {}
+        
+        # Scale NIR exposures if present
+        if obs.nir_duration and obs.nir_duration > 0:
+            original_nir = obs.nir_duration
+            scaled_nir = original_nir * scale_factor
+            scaled['nir_duration_minutes'] = scaled_nir
+            
+            # If we have exposure info, scale count (round to nearest integer)
+            if hasattr(obs, 'nir_exposure_count'):
+                scaled['nir_exposure_count'] = max(1, round(obs.nir_exposure_count * scale_factor))
+        
+        # Scale visible exposures if present
+        if obs.visible_duration and obs.visible_duration > 0:
+            original_vis = obs.visible_duration
+            scaled_vis = original_vis * scale_factor
+            scaled['vis_duration_minutes'] = scaled_vis
+            
+            if hasattr(obs, 'vis_exposure_count'):
+                scaled['vis_exposure_count'] = max(1, round(obs.vis_exposure_count * scale_factor))
+        
+        logger.info(f"      Scaled camera parameters by {scale_factor:.2f}:")
+        for key, value in scaled.items():
+            logger.info(f"        {key}: {value}")
+        
+        return scaled
 
 
-def print_diagnostics_report(diagnostics: Dict, output_format="console", output_file=None, show_detailed_sequences=False):
-    """
-    Print a formatted diagnostics report
+def print_visibility_windows_for_observation(obs: Observation):
+    """Print all visibility windows for an observation."""
+    logger.info(f"\nVisibility windows for {obs.obs_id}:")
+    logger.info(f"  Total windows: {len(obs.visibility_windows)}")
     
-    Parameters:
-    - diagnostics: Dictionary of diagnostic information
-    - output_format: "console" or "csv"
-    - output_file: Path to output file (if CSV format)
-    - show_detailed_sequences: Print every observation sequence with duration
-    """
-    if output_format == "console":
-        print("\n" + "="*60)
-        print("SCHEDULE DIAGNOSTICS REPORT")
-        print("="*60)
-        
-        if 'schedule_start_time' in diagnostics and 'schedule_end_time' in diagnostics:
-            print(f"\nSchedule Start: {diagnostics['schedule_start_time']}")
-            print(f"Schedule End: {diagnostics['schedule_end_time']}")
-        
-        print(f"\nTOTAL SCHEDULE DURATION: {diagnostics['total_schedule_time']/60:.1f} minutes")
-        print(f"TIME BEYOND COMMISSIONING: {diagnostics['time_beyond_commissioning']/60:.1f} minutes")
-        print(f"CVZ OBSERVING TIME: {diagnostics['cvz_time']/60:.1f} minutes")
-        
-        if 'task_observation_efficiency' in diagnostics:
-            print(f"\nTASK OBSERVATION EFFICIENCY: {diagnostics['task_observation_efficiency']:.1%}")
-            print(f"(Time spent on tasks vs. total schedule time)")
-        
-        print(f"\nTASK DURATIONS:")
-        for task, duration in sorted(diagnostics['task_durations'].items()):
-            obs_count = diagnostics['observation_counts'].get(task, 0)
-            print(f"  Task {task}: {duration/60:.1f} minutes ({obs_count} observations)")
-        
-        print(f"\nSCHEDULING ORDER:")
-        for i, obs in enumerate(diagnostics['scheduling_order'], 1):
-            print(f"  {i:3d}. Task {obs['task']}: {obs['duration']/60:.1f} minutes "
-                  f"at {obs['start_time'].strftime('%Y-%m-%d %H:%M:%S')} - {obs['target']}")
-        
-        # Show detailed sequences if requested and available
-        if show_detailed_sequences and diagnostics.get('detailed_sequences'):
-            print(f"\nDETAILED OBSERVATION SEQUENCES:")
-            print(f"{'Seq#':>4} {'Visit':>6} {'ObsSeq':>6} {'Task':>6} {'Duration':>10} {'Start Time':>19} {'Target'}")
-            print("-" * 80)
-            for seq in diagnostics['detailed_sequences']:
-                print(f"{seq['sequence_number']:>4} "
-                      f"{seq['visit_id']:>6} "
-                      f"{seq['obs_seq_id']:>6} "
-                      f"{seq['task']:>6} "
-                      f"{seq['duration_minutes']:>8.1f}m "
-                      f"{seq['start_time'].strftime('%Y-%m-%d %H:%M:%S')} "
-                      f"{seq['target']}")
-        
-        print(f"\nTARGET INFORMATION:")
-        for (ra, dec), info in sorted(diagnostics['target_info'].items(), 
-                                     key=lambda x: x[1]['duration'], reverse=True):
-            print(f"  {info['name']:<30} (RA={ra:.3f}, DEC={dec:.3f}): "
-                  f"{info['duration']/60:.1f} minutes, Task={info['task']}")
-        
-        if diagnostics.get('matching_issues'):
-            print(f"\nMATCHING ISSUES ({len(diagnostics['matching_issues'])} targets could not be matched):")
-            for issue in diagnostics['matching_issues']:
-                print(f"  Visit {issue['visit_id']}: '{issue['target']}' at RA={issue['ra']}, DEC={issue['dec']}")
-        
-        if diagnostics['unscheduled_tasks']:
-            print(f"\nUNSCHEDULED TASKS: {', '.join(diagnostics['unscheduled_tasks'])}")
-        
-        if diagnostics['visibility_issues']:
-            print(f"\nVISIBILITY ISSUES:")
-            for issue in diagnostics['visibility_issues']:
-                print(f"  {issue}")
+    for idx, (start, end) in enumerate(obs.visibility_windows, 1):
+        duration = (end - start).total_seconds() / 60.0
+        logger.info(f"  Window {idx}: {start} to {end} ({duration:.1f} min)")
     
-    elif output_format == "csv" and output_file:
-        import csv
-        
-        # Write comprehensive CSV report
-        with open(output_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            
-            # Schedule Summary
-            writer.writerow(['Schedule Summary'])
-            writer.writerow(['Total Schedule Duration (minutes)', f"{diagnostics['total_schedule_time']/60:.1f}"])
-            writer.writerow(['Time Beyond Commissioning (minutes)', f"{diagnostics['time_beyond_commissioning']/60:.1f}"])
-            writer.writerow(['CVZ Time (minutes)', f"{diagnostics['cvz_time']/60:.1f}"])
-            writer.writerow(['Task Observation Efficiency', f"{diagnostics.get('task_observation_efficiency', 0):.1%}"])
-            writer.writerow([])
-            
-            # Task Durations
-            writer.writerow(['Task Durations'])
-            writer.writerow(['Task', 'Duration (minutes)', 'Observations'])
-            for task, duration in sorted(diagnostics['task_durations'].items()):
-                obs_count = diagnostics['observation_counts'].get(task, 0)
-                writer.writerow([task, f"{duration/60:.1f}", obs_count])
-            writer.writerow([])
-            
-            # Scheduling Order
-            writer.writerow(['Scheduling Order'])
-            writer.writerow(['Order', 'Task', 'Duration (minutes)', 'Start Time', 'Target', 'Visit ID', 'Obs Seq ID'])
-            for i, obs in enumerate(diagnostics['scheduling_order'], 1):
-                writer.writerow([
-                    i,
-                    obs['task'],
-                    f"{obs['duration']/60:.1f}",
-                    obs['start_time'].strftime('%Y-%m-%d %H:%M:%S'),
-                    obs['target'],
-                    obs['visit_id'],
-                    obs.get('obs_seq_id', 'N/A')
-                ])
-            writer.writerow([])
-            
-            # Detailed Sequences (if available)
-            if diagnostics.get('detailed_sequences'):
-                writer.writerow(['Detailed Observation Sequences'])
-                writer.writerow(['Sequence #', 'Visit ID', 'Obs Seq ID', 'Task', 'Duration (minutes)', 
-                               'Start Time', 'Stop Time', 'Target', 'RA', 'DEC'])
-                for seq in diagnostics['detailed_sequences']:
-                    writer.writerow([
-                        seq['sequence_number'],
-                        seq['visit_id'],
-                        seq['obs_seq_id'],
-                        seq['task'],
-                        f"{seq['duration_minutes']:.1f}",
-                        seq['start_time'].strftime('%Y-%m-%d %H:%M:%S'),
-                        seq['stop_time'].strftime('%Y-%m-%d %H:%M:%S'),
-                        seq['target'],
-                        seq['ra'],
-                        seq['dec']
-                    ])
-                writer.writerow([])
-            
-            # Target Information
-            writer.writerow(['Target Information'])
-            writer.writerow(['Target', 'RA', 'DEC', 'Duration (minutes)', 'Task'])
-            for (ra, dec), info in sorted(diagnostics['target_info'].items(), 
-                                         key=lambda x: x[1]['duration'], reverse=True):
-                writer.writerow([
-                    info['name'], 
-                    f"{ra:.3f}", 
-                    f"{dec:.3f}", 
-                    f"{info['duration']/60:.1f}",
-                    info['task']
-                ])
-            writer.writerow([])
-            
-            # Matching Issues
-            if diagnostics.get('matching_issues'):
-                writer.writerow(['Matching Issues'])
-                writer.writerow(['Visit ID', 'Obs Seq ID', 'Target', 'RA', 'DEC'])
-                for issue in diagnostics['matching_issues']:
-                    writer.writerow([
-                        issue['visit_id'],
-                        issue.get('obs_seq_id', 'N/A'),
-                        issue['target'],
-                        issue['ra'],
-                        issue['dec']
-                    ])
-                writer.writerow([])
-            
-            # Unscheduled Tasks
-            if diagnostics['unscheduled_tasks']:
-                writer.writerow(['Unscheduled Tasks'])
-                for task in diagnostics['unscheduled_tasks']:
-                    writer.writerow([task])
-        
-        print(f"CSV diagnostic report written to {output_file}")
-    else:
-        print("Invalid output format or missing output file for CSV format")
-
-
-# -----------------------------
-# CLI entrypoint
-# -----------------------------
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Combine commissioning XML files into a master schedule.")
-    parser.add_argument("xml_dir", help="Directory containing task XML files")
-    parser.add_argument("output", help="Output master XML path")
-    parser.add_argument("--cvz-ra", type=float, required=True, help="CVZ pointing RA (deg)")
-    parser.add_argument("--cvz-dec", type=float, required=True, help="CVZ pointing DEC (deg)")
-    parser.add_argument("--tle1", type=str, required=True, help="TLE line 1")
-    parser.add_argument("--tle2", type=str, required=True, help="TLE line 2")
-    parser.add_argument("--start", type=str, default="2026-01-05T00:00:00", help="Commissioning start UTC")
-    parser.add_argument("--end", type=str, default="2026-02-05T00:00:00", help="Commissioning end UTC")
-    parser.add_argument("--ephem", type=str, default=None, help="Ephemeris file for cardinal pointings")
-    parser.add_argument("--dep", type=str, default=None, help="Dependency JSON file")
-    parser.add_argument("--progress", type=str, default=None, help="Progress JSON file")
-    parser.add_argument("--cvz", type=str, default=None, help="Extra CVZ JSON file")
-    args = parser.parse_args()
-
-    xml_paths = gather_task_xmls(args.xml_dir)
-    result = merge_schedules(
-        xml_paths, args.output, (args.cvz_ra, args.cvz_dec), args.tle1, args.tle2,
-        commissioning_start=datetime.fromisoformat(args.start),
-        commissioning_end=datetime.fromisoformat(args.end),
-        pointing_ephem_file=args.ephem,
-        dependency_json=args.dep,
-        progress_json=args.progress,
-        extra_cvz_json=args.cvz
-    )
-    print("Merge complete:", result)
+    if obs.visibility_windows:
+        total_visible = sum((end - start).total_seconds() / 60.0 for start, end in obs.visibility_windows)
+        logger.info(f"  Total visible time: {total_visible:.1f} minutes")
