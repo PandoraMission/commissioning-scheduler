@@ -6,7 +6,7 @@ authors = [
     {name = "Ben Hord",email = "drbenhord@gmail.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<4.0"
 dependencies = [
     "rich (>=13.9.4,<14.0.0)",
     "numpy (>=1.23.2)",
@@ -15,6 +15,8 @@ dependencies = [
     "astropy (>=6.1.7)",
     "pandas (>=2.1.0)",
     "numexpr (>=2.8.5)",
+    "openpyxl (>=3.1.5)",
+    "pandoravisibility @ git+https://github.com/PandoraMission/pandora-visibility.git",
 ]
 
 [tool.poetry]
