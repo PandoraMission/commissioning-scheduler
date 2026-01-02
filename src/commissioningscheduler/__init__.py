@@ -12,7 +12,7 @@ from .models import (
     ObservationSequence,
     Visit,
     SchedulerConfig,
-    SchedulingResult
+    SchedulingResult,
 )
 from .scheduler import Scheduler
 from .xml_io import ObservationParser, ScheduleWriter, gather_task_xmls
@@ -21,34 +21,35 @@ from .visibility import (
     compute_target_visibility,
     get_default_cache_dir,
     clear_visibility_cache,
-    get_cache_info
+    get_cache_info,
 )
 from .constraints import ConstraintChecker, SpecialConstraintHandler
 from .diagnostics import analyze_schedule_diagnostics, print_diagnostics_report
 
 __all__ = [
-    'Observation',
-    'ObservationSequence',
-    'Visit',
-    'SchedulerConfig',
-    'SchedulingResult',
-    'Scheduler',
-    'ObservationParser',
-    'ScheduleWriter',
-    'gather_task_xmls',
-    'VisibilityCalculator',
-    'compute_target_visibility',
-    'get_default_cache_dir',
-    'clear_visibility_cache',
-    'get_cache_info',
-    'ConstraintChecker',
-    'SpecialConstraintHandler',
-    'analyze_schedule_diagnostics',
-    'print_diagnostics_report',
+    "Observation",
+    "ObservationSequence",
+    "Visit",
+    "SchedulerConfig",
+    "SchedulingResult",
+    "Scheduler",
+    "ObservationParser",
+    "ScheduleWriter",
+    "gather_task_xmls",
+    "VisibilityCalculator",
+    "compute_target_visibility",
+    "get_default_cache_dir",
+    "clear_visibility_cache",
+    "get_cache_info",
+    "ConstraintChecker",
+    "SpecialConstraintHandler",
+    "analyze_schedule_diagnostics",
+    "print_diagnostics_report",
 ]
 
 
 # Convenience functions
+
 
 def schedule_observations(
     xml_dir: str,
@@ -58,7 +59,7 @@ def schedule_observations(
     commissioning_start,
     commissioning_end,
     cvz_coords=(120.0, 8.5),
-    **kwargs
+    **kwargs,
 ):
     """
     Convenience function to schedule observations.
@@ -86,8 +87,8 @@ def schedule_observations(
     xml_paths = gather_task_xmls(xml_dir)
 
     # Support both old and new parameter names
-    if 'dependency_json' in kwargs and 'constraints_json' not in kwargs:
-        kwargs['constraints_json'] = kwargs.pop('dependency_json')
+    if "dependency_json" in kwargs and "constraints_json" not in kwargs:
+        kwargs["constraints_json"] = kwargs.pop("dependency_json")
 
     # Create config
     config = SchedulerConfig(
@@ -96,7 +97,7 @@ def schedule_observations(
         commissioning_start=commissioning_start,
         commissioning_end=commissioning_end,
         cvz_coords=cvz_coords,
-        **kwargs
+        **kwargs,
     )
 
     # Create scheduler and run

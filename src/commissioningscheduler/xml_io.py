@@ -9,7 +9,11 @@ import uuid
 import datetime
 
 from .models import Observation, ObservationSequence, Visit, SchedulerConfig
-from .utils import parse_utc_time, format_utc_time, compute_data_volume_gb
+from .utils import (
+    # parse_utc_time,
+    format_utc_time,
+    # compute_data_volume_gb
+)
 
 logger = logging.getLogger(__name__)
 
@@ -702,7 +706,7 @@ class ScheduleWriter:
         meta = ET.SubElement(root, "Meta")
         if metadata:
             for key, value in metadata.items():
-                if key == 'Total_Visits':
+                if key == "Total_Visits":
                     value = len(visits)
                 meta.set(key, str(value))
 
