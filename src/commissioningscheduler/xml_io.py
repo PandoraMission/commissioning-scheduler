@@ -8,12 +8,15 @@ import logging
 import uuid
 import datetime
 
+from astropy.time import Time
+
 from .models import Observation, ObservationSequence, Visit, SchedulerConfig
 from .utils import (
     # parse_utc_time,
     format_utc_time,
     # compute_data_volume_gb
 )
+from .roll import calculate_roll
 
 logger = logging.getLogger(__name__)
 
@@ -495,6 +498,47 @@ class ScheduleWriter:
             if dec_elem is not None:
                 dec_elem.text = str(seq.boresight_dec)
 
+        # Calculate and update/add Roll angle
+        if (
+            seq.boresight_ra is not None
+            and seq.boresight_dec is not None
+            and seq.start is not None
+        ):
+            try:
+                obs_time = Time(seq.start)
+                roll_angle = calculate_roll(
+                    seq.boresight_ra, seq.boresight_dec, obs_time
+                )
+
+                # Find or create Roll element in Boresight
+                boresight_elem = seq_elem.find(".//Boresight")
+                if boresight_elem is not None:
+                    roll_elem = boresight_elem.find("Roll")
+                    if roll_elem is None:
+                        # Create Roll element after DEC
+                        dec_elem = boresight_elem.find("DEC")
+                        if dec_elem is not None:
+                            dec_index = list(boresight_elem).index(dec_elem)
+                            roll_elem = ET.Element("Roll")
+                            boresight_elem.insert(dec_index + 1, roll_elem)
+                        else:
+                            # If DEC not found, just append
+                            roll_elem = ET.SubElement(boresight_elem, "Roll")
+
+                    roll_elem.text = f"{roll_angle:.6f}"
+                    logger.debug(
+                        f"Calculated roll angle {roll_angle:.6f} for sequence {seq.sequence_id}"
+                    )
+                else:
+                    logger.warning(
+                        f"Boresight element not found for sequence {seq.sequence_id}"
+                    )
+
+            except Exception as e:
+                logger.error(
+                    f"Failed to calculate roll for sequence {seq.sequence_id}: {e}"
+                )
+
         # Apply adjusted camera parameters if they exist
         if "adjusted_params" in seq.metadata:
             adjusted = seq.metadata["adjusted_params"]
@@ -594,6 +638,27 @@ class ScheduleWriter:
         ra_elem.text = str(ra or 0.0)
         dec_elem = ET.SubElement(boresight_elem, "DEC")
         dec_elem.text = str(dec or 0.0)
+
+        # Calculate and add roll angle
+        if (
+            seq.boresight_ra is not None
+            and seq.boresight_dec is not None
+            and seq.start is not None
+        ):
+            try:
+                obs_time = Time(seq.start)
+                roll_angle = calculate_roll(
+                    seq.boresight_ra, seq.boresight_dec, obs_time
+                )
+                roll_elem = ET.SubElement(boresight_elem, "Roll")
+                roll_elem.text = f"{roll_angle:.6f}"
+                logger.debug(
+                    f"Calculated roll angle {roll_angle:.6f} for sequence {seq.sequence_id}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to calculate roll for sequence {seq.sequence_id}: {e}"
+                )
 
         return obs_seq_elem
 
@@ -870,6 +935,27 @@ class ScheduleWriter:
         ra_elem.text = str(seq.boresight_ra or 0.0)
         dec_elem = ET.SubElement(boresight_elem, "DEC")
         dec_elem.text = str(seq.boresight_dec or 0.0)
+
+        # Calculate and add roll angle
+        if (
+            seq.boresight_ra is not None
+            and seq.boresight_dec is not None
+            and seq.start is not None
+        ):
+            try:
+                obs_time = Time(seq.start)
+                roll_angle = calculate_roll(
+                    seq.boresight_ra, seq.boresight_dec, obs_time
+                )
+                roll_elem = ET.SubElement(boresight_elem, "Roll")
+                roll_elem.text = f"{roll_angle:.6f}"
+                logger.debug(
+                    f"Calculated roll angle {roll_angle:.6f} for sequence {seq.sequence_id}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to calculate roll for sequence {seq.sequence_id}: {e}"
+                )
 
         # Payload with only visible camera
         payload = ET.SubElement(obs_seq_elem, "Payload_Parameters")
