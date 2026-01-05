@@ -1817,7 +1817,7 @@ class Scheduler:
                 target_name=obs.target_name,
                 boresight_ra=obs.boresight_ra,
                 boresight_dec=obs.boresight_dec,
-                priority=obs.priority,
+                priority=int(obs.priority),
                 science_duration_minutes=science_duration,
                 nir_duration_minutes=(
                     obs.nir_duration if seq_type == "data" else None
