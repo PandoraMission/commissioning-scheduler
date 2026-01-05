@@ -16,6 +16,7 @@ src/commissioningscheduler/~
 src/commissioningscheduler/ip_scheduler
 src/commissioningscheduler/master_schedule.xml
 src/commissioningscheduler/test_run.py
+old/
 
 # Mac things
 .DS_Store
