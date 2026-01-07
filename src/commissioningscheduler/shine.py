@@ -514,7 +514,7 @@ class EarthshinePointing:
     Calculate telescope pointing for Earthshine observations.
 
     Finds orbital positions and computes RA/Dec pointing at specified distances
-    from Earth's limb.
+    from Earth's limb in the antisolar direction.
     """
 
     def __init__(self, ephemeris: EphemerisProvider):
@@ -526,9 +526,9 @@ class EarthshinePointing:
         """
         self.ephemeris = ephemeris
 
-        # Calculate reference orbital position (northernmost point)
-        # This is done once to establish consistent reference
-        self._orbital_reference = None
+        # Cache for orbital period determination
+        self._orbital_period_minutes = None
+        self._period_reference_time = None
 
     def calculate_pointing(
         self,
@@ -537,12 +537,14 @@ class EarthshinePointing:
         limb_separation_deg: float,
         max_search_orbits: int = 3,
         position_tolerance_deg: float = 5.0,
+        sun_avoidance_deg: float = SUN_AVOIDANCE_ANGLE,
     ) -> EarthshineResult:
         """
         Calculate pointing for Earthshine observation.
 
-        Finds the next time after start_time when spacecraft reaches the desired
-        orbital position, then computes pointing.
+        For sun-synchronous orbit, we find when spacecraft reaches the desired
+        orbital position, then point in the antisolar direction at the specified
+        angle from Earth's limb.
 
         Args:
             start_time: Earliest time to search from
@@ -550,12 +552,13 @@ class EarthshinePointing:
             limb_separation_deg: Angular separation from Earth's limb (degrees)
             max_search_orbits: Maximum number of orbits to search
             position_tolerance_deg: Tolerance for orbital position match
+            sun_avoidance_deg: Minimum angle from Sun center
 
         Returns:
             EarthshineResult
         """
         # Find when spacecraft reaches desired orbital position
-        target_time = self._find_orbital_position(
+        target_time, actual_position = self._find_orbital_position(
             start_time,
             orbital_position_deg,
             max_search_orbits,
@@ -572,6 +575,60 @@ class EarthshinePointing:
         sc_state = self.ephemeris.get_spacecraft_state(target_time)
         sc_pos = sc_state.position_km
 
+        # Get Sun position
+        sun_pos = self.ephemeris.get_sun_position(target_time)
+
+        # Calculate pointing in antisolar direction at N degrees from Earth limb
+        pointing_vector, sun_angle_deg = self._calculate_antisolar_pointing(
+            sc_pos, sun_pos, limb_separation_deg
+        )
+
+        # Convert to RA/Dec
+        ra_deg, dec_deg = self._vector_to_radec(pointing_vector)
+
+        # Verify constraints
+        in_antisolar = sun_angle_deg > 90.0
+        sun_ok = sun_angle_deg >= sun_avoidance_deg
+
+        if not sun_ok:
+            logger.warning(
+                f"Pointing violates Sun avoidance: {sun_angle_deg:.1f}° < {sun_avoidance_deg}°"
+            )
+
+        return EarthshineResult(
+            ra_deg=ra_deg,
+            dec_deg=dec_deg,
+            time=target_time,
+            orbital_position_deg=actual_position,
+            limb_separation_deg=limb_separation_deg,
+            pointing_in_antisolar=in_antisolar and sun_ok,
+            sun_angle_deg=sun_angle_deg,
+            pointing_vector_eci=pointing_vector,
+            spacecraft_position_eci=sc_pos,
+        )
+
+    def _calculate_antisolar_pointing(
+        self,
+        sc_pos: np.ndarray,
+        sun_pos: np.ndarray,
+        limb_separation_deg: float,
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Calculate pointing in antisolar direction at specified angle from Earth limb.
+
+        Strategy:
+        1. Find the antisolar direction (away from Sun)
+        2. Calculate the cone of directions that are N degrees from Earth limb
+        3. Find the intersection point closest to antisolar direction
+
+        Args:
+            sc_pos: Spacecraft position (km)
+            sun_pos: Sun position (km)
+            limb_separation_deg: Degrees from Earth limb
+
+        Returns:
+            Tuple of (pointing_vector, sun_angle_deg)
+        """
         # Calculate Earth's angular radius as seen from spacecraft
         sc_distance = np.linalg.norm(sc_pos)
         earth_angular_radius_deg = np.degrees(
@@ -580,52 +637,51 @@ class EarthshinePointing:
 
         # Total angle from Earth center to pointing
         total_angle_deg = earth_angular_radius_deg + limb_separation_deg
+        total_angle_rad = np.radians(total_angle_deg)
 
-        # Define pointing direction
-        # Point perpendicular to Earth limb, away from Earth center
-        # This is in the orbital plane, perpendicular to radial direction
-
-        # Get orbital plane normal (angular momentum direction)
-        h = np.cross(sc_pos, sc_state.velocity_km_s)
-        h_unit = h / np.linalg.norm(h)
+        # Antisolar direction
+        sc_to_sun = sun_pos - sc_pos
+        antisolar_unit = -sc_to_sun / np.linalg.norm(sc_to_sun)
 
         # Radial direction (away from Earth)
         radial_unit = sc_pos / sc_distance
 
-        # Tangential direction in orbital plane
-        tangent_unit = np.cross(h_unit, radial_unit)
+        # The pointing must be on a cone of half-angle total_angle_deg around radial_unit
+        # We want the point on this cone closest to the antisolar direction
 
-        # Pointing vector: tilt from radial by total_angle_deg in direction of tangent
-        total_angle_rad = np.radians(total_angle_deg)
+        # Project antisolar onto the plane perpendicular to radial
+        antisolar_perp = (
+            antisolar_unit - np.dot(antisolar_unit, radial_unit) * radial_unit
+        )
+        antisolar_perp_norm = np.linalg.norm(antisolar_perp)
+
+        if antisolar_perp_norm < 1e-6:
+            # Antisolar is aligned with radial - use arbitrary perpendicular direction
+            # This shouldn't happen for realistic geometries
+            if abs(radial_unit[0]) < 0.9:
+                perp_dir = np.array([1, 0, 0])
+            else:
+                perp_dir = np.array([0, 1, 0])
+            antisolar_perp = (
+                perp_dir - np.dot(perp_dir, radial_unit) * radial_unit
+            )
+            antisolar_perp = antisolar_perp / np.linalg.norm(antisolar_perp)
+        else:
+            antisolar_perp = antisolar_perp / antisolar_perp_norm
+
+        # Construct pointing on cone in direction of antisolar
         pointing_vector = (
             np.cos(total_angle_rad) * radial_unit
-            + np.sin(total_angle_rad) * tangent_unit
+            + np.sin(total_angle_rad) * antisolar_perp
         )
         pointing_vector = pointing_vector / np.linalg.norm(pointing_vector)
 
-        # Convert to RA/Dec
-        ra_deg, dec_deg = self._vector_to_radec(pointing_vector)
-
-        # Check if pointing is in antisolar hemisphere and Sun avoidance
-        sun_pos = self.ephemeris.get_sun_position(target_time)
-        sun_angle_deg, in_antisolar = self._check_sun_constraints(
-            pointing_vector, sc_pos, sun_pos
+        # Calculate actual Sun angle
+        sun_angle_deg = np.degrees(
+            np.arccos(np.clip(np.dot(pointing_vector, -antisolar_unit), -1, 1))
         )
 
-        # Get actual orbital position achieved
-        actual_position_deg = self._get_orbital_position(sc_state)
-
-        return EarthshineResult(
-            ra_deg=ra_deg,
-            dec_deg=dec_deg,
-            time=target_time,
-            orbital_position_deg=actual_position_deg,
-            limb_separation_deg=limb_separation_deg,
-            pointing_in_antisolar=in_antisolar,
-            sun_angle_deg=sun_angle_deg,
-            pointing_vector_eci=pointing_vector,
-            spacecraft_position_eci=sc_pos,
-        )
+        return pointing_vector, sun_angle_deg
 
     def _find_orbital_position(
         self,
@@ -633,7 +689,7 @@ class EarthshinePointing:
         target_position_deg: float,
         max_orbits: int,
         tolerance_deg: float,
-    ) -> Optional[Time]:
+    ) -> Tuple[Optional[Time], Optional[float]]:
         """
         Find next time when spacecraft reaches target orbital position.
 
@@ -644,15 +700,16 @@ class EarthshinePointing:
             tolerance_deg: Position tolerance
 
         Returns:
-            Time when position is reached, or None if not found
+            Tuple of (time, actual_position) or (None, None) if not found
         """
-        # Estimate orbital period (assume ~95 minutes for LEO)
-        orbital_period_minutes = 95.0
+        # Determine orbital period if not cached
+        if self._orbital_period_minutes is None:
+            self._determine_orbital_period(start_time)
 
         # Search with 1-minute time steps
         time_step_minutes = 1.0
         max_steps = int(
-            max_orbits * orbital_period_minutes / time_step_minutes
+            max_orbits * self._orbital_period_minutes / time_step_minutes
         )
 
         # Normalize target position
@@ -669,28 +726,45 @@ class EarthshinePointing:
                 current_position = self._get_orbital_position(sc_state)
 
                 # Check if we're within tolerance
-                delta = abs(current_position - target_position_deg)
-                if delta > 180:
-                    delta = 360 - delta
+                delta = self._angular_difference(
+                    current_position, target_position_deg
+                )
 
-                if delta <= tolerance_deg:
+                if abs(delta) <= tolerance_deg:
                     logger.info(
                         f"Found orbital position {current_position:.1f}° "
                         f"(target {target_position_deg:.1f}°) at {current_time.iso}"
                     )
-                    return current_time
+                    return current_time, current_position
 
-                # Check if we crossed the target (for better accuracy)
+                # Check if we crossed the target
                 if prev_position is not None:
-                    crossed = self._check_crossing(
-                        prev_position, current_position, target_position_deg
+                    prev_delta = self._angular_difference(
+                        prev_position, target_position_deg
                     )
-                    if crossed:
+
+                    # Crossed if deltas have opposite signs and we're moving forward
+                    if prev_delta < 0 and delta > 0:
                         # Refine with interpolation
                         refined_time = self._refine_crossing(
-                            prev_time, current_time, target_position_deg
+                            prev_time,
+                            current_time,
+                            prev_position,
+                            current_position,
+                            target_position_deg,
                         )
-                        return refined_time
+                        refined_state = self.ephemeris.get_spacecraft_state(
+                            refined_time
+                        )
+                        refined_position = self._get_orbital_position(
+                            refined_state
+                        )
+
+                        logger.info(
+                            f"Found orbital position {refined_position:.1f}° "
+                            f"(target {target_position_deg:.1f}°) at {refined_time.iso}"
+                        )
+                        return refined_time, refined_position
 
                 prev_position = current_position
                 prev_time = current_time
@@ -703,157 +777,177 @@ class EarthshinePointing:
             f"Could not find orbital position {target_position_deg}° "
             f"within {max_orbits} orbits"
         )
-        return None
+        return None, None
+
+    def _determine_orbital_period(self, reference_time: Time):
+        """
+        Determine orbital period by tracking latitude changes.
+
+        Args:
+            reference_time: Reference time for period determination
+        """
+        logger.info("Determining orbital period...")
+
+        # Get initial position
+        initial_state = self.ephemeris.get_spacecraft_state(reference_time)
+        initial_lat = self._get_latitude(initial_state.position_km)
+
+        # Search for return to same latitude with same velocity direction
+        # This indicates one complete orbit
+        time_step = 1.0  # minutes
+        max_steps = 200  # ~3 hours max
+
+        prev_lat = initial_lat
+        ascending_initially = initial_state.velocity_km_s[2] > 0
+
+        for i in range(1, max_steps):
+            current_time = reference_time + i * time_step * u.min
+            current_state = self.ephemeris.get_spacecraft_state(current_time)
+            current_lat = self._get_latitude(current_state.position_km)
+            ascending_now = current_state.velocity_km_s[2] > 0
+
+            # Check if we crossed the initial latitude going the same direction
+            if ascending_now == ascending_initially:
+                if (prev_lat < initial_lat <= current_lat) or (
+                    prev_lat > initial_lat >= current_lat
+                ):
+                    # Found approximate period
+                    period_minutes = i * time_step
+                    self._orbital_period_minutes = period_minutes
+                    self._period_reference_time = reference_time
+                    logger.info(
+                        f"Orbital period: {period_minutes:.2f} minutes"
+                    )
+                    return
+
+            prev_lat = current_lat
+
+        # Fallback to nominal LEO period
+        self._orbital_period_minutes = 95.0
+        logger.warning("Could not determine period, using 95 minutes")
+
+    def _get_latitude(self, position: np.ndarray) -> float:
+        """Get geodetic latitude from ECI position."""
+        r = np.linalg.norm(position)
+        lat_rad = np.arcsin(position[2] / r)
+        return np.degrees(lat_rad)
 
     def _get_orbital_position(self, sc_state: SpacecraftState) -> float:
         """
         Calculate orbital position in degrees (0-360).
 
-        Position is defined relative to the northernmost point of the orbit.
+        Position is measured as the angle around the orbit, where 0° corresponds
+        to the northernmost point (maximum latitude).
+
+        For a sun-synchronous orbit:
+        - 0° = Maximum northern latitude (over North pole region)
+        - 90° = Descending equator crossing
+        - 180° = Maximum southern latitude (over South pole region)
+        - 270° = Ascending equator crossing
 
         Args:
             sc_state: Spacecraft state
 
         Returns:
-            Orbital position in degrees (0 = northernmost point)
+            Orbital position in degrees (0-360)
         """
-        # Calculate argument of latitude (angle from ascending node in orbital plane)
         pos = sc_state.position_km
         vel = sc_state.velocity_km_s
 
-        # Orbital plane normal
+        # Calculate orbital plane normal (angular momentum direction)
         h = np.cross(pos, vel)
         h_unit = h / np.linalg.norm(h)
 
-        # Ascending node direction (where orbit crosses equator going north)
-        # This is the intersection of orbital plane with equatorial plane
-        z_axis = np.array([0, 0, 1])  # Earth's pole
+        # For position in orbit, we use the argument of latitude
+        # This is the angle from ascending node measured in the orbital plane
+
+        # Ascending node is where orbit crosses equator going north
+        # It's the intersection of orbital plane with equatorial plane
+        z_axis = np.array([0, 0, 1])  # North pole direction
+
+        # Node vector (perpendicular to both z and h)
         n = np.cross(z_axis, h_unit)
         n_norm = np.linalg.norm(n)
 
         if n_norm < 1e-6:
-            # Polar orbit - use arbitrary reference
+            # Orbit is polar - use x-axis as reference
             n = np.array([1, 0, 0])
-        else:
-            n = n / n_norm
+            n_norm = 1.0
 
-        # Calculate angle from ascending node to spacecraft position
-        # Project position into orbital plane coordinate system
+        n_unit = n / n_norm
+
+        # Calculate argument of latitude
+        # This is angle from ascending node to current position
         r_unit = pos / np.linalg.norm(pos)
 
-        # Angle in orbital plane
-        cos_angle = np.dot(r_unit, n)
-        sin_angle = np.dot(r_unit, np.cross(h_unit, n))
-        angle = np.degrees(np.arctan2(sin_angle, cos_angle))
+        # Components in orbital frame
+        cos_u = np.dot(r_unit, n_unit)
 
-        if angle < 0:
-            angle += 360
+        # Third axis of orbital frame (completes right-handed system)
+        n_perp = np.cross(h_unit, n_unit)
+        sin_u = np.dot(r_unit, n_perp)
 
-        # Find northernmost point offset (done once for reference)
-        if self._orbital_reference is None:
-            self._orbital_reference = self._find_northernmost_point_offset(
-                sc_state
-            )
+        # Argument of latitude
+        u = np.degrees(np.arctan2(sin_u, cos_u))
+        if u < 0:
+            u += 360
 
-        # Adjust so 0° is at northernmost point
-        position = (angle - self._orbital_reference) % 360.0
+        # Now determine offset so that 0° is at northernmost point
+        # The northernmost point is where latitude is maximum
+        # This occurs where position is most aligned with z-axis
 
-        return position
+        # For an inclined orbit, max latitude occurs at argument of latitude = 90°
+        # (or 270° for min latitude)
+        # For sun-synchronous orbit with inclination ~98°, the ascending node
+        # is where we cross equator going north, so max north is at u = 90°
 
-    def _find_northernmost_point_offset(
-        self, sc_state: SpacecraftState
-    ) -> float:
+        # Adjust so 0° = maximum northern latitude
+        orbital_position = (u - 90.0) % 360.0
+
+        return orbital_position
+
+    def _angular_difference(self, angle1: float, angle2: float) -> float:
         """
-        Find the angle offset to the northernmost point of the orbit.
+        Calculate signed angular difference (angle1 - angle2).
 
-        Args:
-            sc_state: Sample spacecraft state
-
-        Returns:
-            Angle offset in degrees
+        Returns value in range [-180, 180].
         """
-        # Sample positions around orbit
-        pos = sc_state.position_km
-        vel = sc_state.velocity_km_s
-
-        # Orbital elements
-        h = np.cross(pos, vel)
-        h_unit = h / np.linalg.norm(h)
-
-        # Find point with maximum Z coordinate (northernmost)
-        # This occurs when position vector is perpendicular to h and points north
-        z_axis = np.array([0, 0, 1])
-
-        # Northernmost direction in orbital plane
-        north_in_plane = z_axis - np.dot(z_axis, h_unit) * h_unit
-        north_in_plane = north_in_plane / np.linalg.norm(north_in_plane)
-
-        # Find ascending node
-        n = np.cross(z_axis, h_unit)
-        n_norm = np.linalg.norm(n)
-        if n_norm < 1e-6:
-            return 0.0
-        n = n / n_norm
-
-        # Angle from ascending node to northernmost point
-        cos_angle = np.dot(north_in_plane, n)
-        sin_angle = np.dot(north_in_plane, np.cross(h_unit, n))
-        offset = np.degrees(np.arctan2(sin_angle, cos_angle))
-
-        if offset < 0:
-            offset += 360
-
-        return offset
-
-    def _check_crossing(self, pos1: float, pos2: float, target: float) -> bool:
-        """Check if orbital position crossed target between two measurements."""
-
-        # Normalize to handle 360° wraparound
-        def normalize_delta(delta):
-            while delta > 180:
-                delta -= 360
-            while delta < -180:
-                delta += 360
-            return delta
-
-        delta1 = normalize_delta(target - pos1)
-        delta2 = normalize_delta(target - pos2)
-
-        # Crossed if signs differ
-        return (delta1 * delta2) < 0
+        diff = (angle1 - angle2) % 360.0
+        if diff > 180:
+            diff -= 360
+        return diff
 
     def _refine_crossing(
-        self, time1: Time, time2: Time, target_position: float
+        self, time1: Time, time2: Time, pos1: float, pos2: float, target: float
     ) -> Time:
         """
-        Refine crossing time using binary search.
+        Refine crossing time using linear interpolation.
 
         Args:
             time1: Earlier time
             time2: Later time
-            target_position: Target orbital position
+            pos1: Position at time1
+            pos2: Position at time2
+            target: Target position
 
         Returns:
             Refined time
         """
-        # Binary search for better accuracy
-        for _ in range(5):  # 5 iterations gives ~2 second accuracy
-            mid_time = time1 + (time2 - time1) / 2
-            sc_state = self.ephemeris.get_spacecraft_state(mid_time)
-            mid_position = self._get_orbital_position(sc_state)
+        # Linear interpolation
+        delta1 = self._angular_difference(target, pos1)
+        delta2 = self._angular_difference(target, pos2)
 
-            if self._check_crossing(
-                self._get_orbital_position(
-                    self.ephemeris.get_spacecraft_state(time1)
-                ),
-                mid_position,
-                target_position,
-            ):
-                time2 = mid_time
-            else:
-                time1 = mid_time
+        # Interpolation fraction
+        if abs(delta2 - delta1) < 1e-6:
+            alpha = 0.5
+        else:
+            alpha = delta1 / (delta1 - delta2)
 
-        return time1 + (time2 - time1) / 2
+        # Clamp to valid range
+        alpha = max(0, min(1, alpha))
+
+        refined_time = time1 + alpha * (time2 - time1)
+        return refined_time
 
     def _vector_to_radec(self, vector: np.ndarray) -> Tuple[float, float]:
         """Convert ECI vector to RA/Dec."""
@@ -861,39 +955,8 @@ class EarthshinePointing:
         ra = np.degrees(np.arctan2(v[1], v[0]))
         if ra < 0:
             ra += 360
-        dec = np.degrees(np.arcsin(v[2]))
+        dec = np.degrees(np.arcsin(np.clip(v[2], -1, 1)))
         return ra, dec
-
-    def _check_sun_constraints(
-        self,
-        pointing_vector: np.ndarray,
-        sc_pos: np.ndarray,
-        sun_pos: np.ndarray,
-    ) -> Tuple[float, bool]:
-        """
-        Check Sun avoidance and antisolar hemisphere constraints.
-
-        Args:
-            pointing_vector: Pointing direction (unit vector)
-            sc_pos: Spacecraft position
-            sun_pos: Sun position
-
-        Returns:
-            Tuple of (sun_angle_deg, in_antisolar_hemisphere)
-        """
-        # Vector from spacecraft to Sun
-        sc_to_sun = sun_pos - sc_pos
-        sc_to_sun_unit = sc_to_sun / np.linalg.norm(sc_to_sun)
-
-        # Angle between pointing and Sun
-        sun_angle = np.degrees(
-            np.arccos(np.clip(np.dot(pointing_vector, sc_to_sun_unit), -1, 1))
-        )
-
-        # Antisolar hemisphere means angle > 90°
-        in_antisolar = sun_angle > 90.0
-
-        return sun_angle, in_antisolar
 
 
 # Convenience functions for common use cases

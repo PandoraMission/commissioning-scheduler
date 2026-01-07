@@ -5,6 +5,7 @@ Test and demonstration script for shine_scheduler.py
 
 import logging
 from astropy.time import Time
+import astropy.units as u
 from shine import (
     EphemerisProvider,
     MoonshinePointing,
@@ -25,10 +26,10 @@ def test_moonshine():
 
     # TLE for Pandora
     tle_line1 = (
-        "1 99152U 25037A   26011.00000000 .000000000  00000+0  00000-0 0   421"
+        "1 99152U 26011B   26005.66013674 .000000000  00000+0  00000-0 0    16"
     )
     tle_line2 = (
-        "2 99152  97.7039   7.4152 0000010   0.1460 360.0000 14.89338871  1231"
+        "2 99152  97.6750  17.6690 0000000 328.8990  20.9640 14.86530781  0004"
     )
 
     # Test time
@@ -64,10 +65,10 @@ def test_earthshine():
 
     # TLE for Pandora
     tle_line1 = (
-        "1 99152U 25037A   26011.00000000 .000000000  00000+0  00000-0 0   421"
+        "1 99152U 26011B   26005.66013674 .000000000  00000+0  00000-0 0    16"
     )
     tle_line2 = (
-        "2 99152  97.7039   7.4152 0000010   0.1460 360.0000 14.89338871  1231"
+        "2 99152  97.6750  17.6690 0000000 328.8990  20.9640 14.86530781  0004"
     )
 
     # Start time
@@ -102,6 +103,86 @@ def test_earthshine():
             print(f"{orbital_pos:>11.0f}° ERROR: {e}")
 
 
+def test_earthshine_detailed():
+    """Detailed test showing orbital positions over time."""
+    print("\n" + "=" * 60)
+    print("EARTHSHINE DETAILED TEST - Orbital Position Tracking")
+    print("=" * 60)
+
+    tle_line1 = (
+        "1 99152U 26011B   26005.66013674 .000000000  00000+0  00000-0 0    16"
+    )
+    tle_line2 = (
+        "2 99152  97.6750  17.6690 0000000 328.8990  20.9640 14.86530781  0004"
+    )
+
+    ephemeris = EphemerisProvider(tle_line1, tle_line2)
+    calculator = EarthshinePointing(ephemeris)
+
+    start_time = Time("2026-02-01 00:00:00", scale="utc")
+
+    print(f"\nTracking orbital position over one orbit:")
+    print(f"Start time: {start_time.iso}")
+    print(
+        f"\n{'Time (min)':>10} {'Orbital Pos':>12} {'Latitude':>10} {'Altitude':>10}"
+    )
+    print("-" * 50)
+
+    # Track position every 5 minutes for ~100 minutes
+    for i in range(0, 105, 5):
+        current_time = start_time + i * u.min
+        sc_state = ephemeris.get_spacecraft_state(current_time)
+        orbital_pos = calculator._get_orbital_position(sc_state)
+        lat = calculator._get_latitude(sc_state.position_km)
+        alt = sc_state.altitude_km
+
+        print(f"{i:>10} {orbital_pos:>11.1f}° {lat:>9.2f}° {alt:>9.1f} km")
+
+
+def test_earthshine_multiple_separations():
+    """Test multiple limb separations at each orbital position."""
+    print("\n" + "=" * 60)
+    print("EARTHSHINE TEST - Multiple Limb Separations")
+    print("=" * 60)
+
+    tle_line1 = (
+        "1 99152U 26011B   26005.66013674 .000000000  00000+0  00000-0 0    16"
+    )
+    tle_line2 = (
+        "2 99152  97.6750  17.6690 0000000 328.8990  20.9640 14.86530781  0004"
+    )
+
+    ephemeris = EphemerisProvider(tle_line1, tle_line2)
+    calculator = EarthshinePointing(ephemeris)
+
+    start_time = Time("2026-02-01 00:00:00", scale="utc")
+
+    orbital_positions = [0, 90, 180, 270]
+    separations = [5, 10, 15, 20]
+
+    print(f"\nSearching from: {start_time.iso}")
+    print(
+        f"\n{'Orb Pos':>8} {'Sep':>5} {'Time':>20} {'RA':>8} {'Dec':>8} "
+        f"{'Sun∠':>6} {'OK':>4}"
+    )
+    print("-" * 70)
+
+    for orb_pos in orbital_positions:
+        for sep in separations:
+            try:
+                result = calculator.calculate_pointing(
+                    start_time, orb_pos, sep
+                )
+                ok = "✓" if result.pointing_in_antisolar else "✗"
+                print(
+                    f"{orb_pos:>8.0f}° {sep:>5.0f}° {result.time.iso:>20} "
+                    f"{result.ra_deg:>8.2f}° {result.dec_deg:>8.2f}° "
+                    f"{result.sun_angle_deg:>6.1f}° {ok:>4}"
+                )
+            except Exception as e:
+                print(f"{orb_pos:>8.0f}° {sep:>5.0f}° ERROR: {str(e)[:40]}")
+
+
 def test_with_gmat_file():
     """Test using GMAT file for ephemeris."""
     print("\n" + "=" * 60)
@@ -123,10 +204,10 @@ def demo_complete_observation_plan():
     print("=" * 60)
 
     tle_line1 = (
-        "1 99152U 25037A   26011.00000000 .000000000  00000+0  00000-0 0   421"
+        "1 99152U 26011B   26005.66013674 .000000000  00000+0  00000-0 0    16"
     )
     tle_line2 = (
-        "2 99152  97.7039   7.4152 0000010   0.1460 360.0000 14.89338871  1231"
+        "2 99152  97.6750  17.6690 0000000 328.8990  20.9640 14.86530781  0004"
     )
 
     start_time = Time("2026-02-01 00:00:00", scale="utc")
@@ -168,7 +249,7 @@ def demo_complete_observation_plan():
                 ):
                     earthshine_count += 1
             except Exception as e:
-                print('!!! Exception:')
+                print("!!! Exception:")
                 print(e)
                 pass
 
@@ -179,6 +260,13 @@ def demo_complete_observation_plan():
 
 
 if __name__ == "__main__":
+    # Run individual tests
     test_moonshine()
     test_earthshine()
+
+    # Additional detailed tests
+    test_earthshine_detailed()
+    test_earthshine_multiple_separations()
+
+    # Complete demo
     demo_complete_observation_plan()
