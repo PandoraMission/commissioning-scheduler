@@ -170,6 +170,10 @@ class ConstraintChecker:
             target_date_str = ms_data.get("target_date", "2026-02-01 00:00:00")
             target_date = parse_utc_time(target_date_str)
 
+            # Load combination filters
+            combinations = ms_data.get("combinations", None)
+            exclude_combinations = ms_data.get("exclude_combinations", None)
+
             self.config.moonshine_config = MoonshineConfig(
                 enabled=ms_data.get("enabled", False),
                 target_date=target_date,
@@ -184,12 +188,29 @@ class ConstraintChecker:
                     "check_moon_visibility", True
                 ),
                 earth_avoidance_deg=ms_data.get("earth_avoidance_deg", 20.0),
+                combinations=combinations,
+                exclude_combinations=exclude_combinations,
             )
-            logger.info(
-                f"Moonshine enabled: target={target_date.isoformat()}, "
-                f"{len(ms_data.get('angular_positions', []))} positions, "
-                f"{len(ms_data.get('limb_separations', []))} separations"
-            )
+            # Log configuration details
+            if combinations:
+                logger.info(
+                    f"Moonshine enabled (whitelist mode): {len(combinations)} specific combinations"
+                )
+            elif exclude_combinations:
+                n_total = len(ms_data.get("angular_positions", [])) * len(
+                    ms_data.get("limb_separations", [])
+                )
+                n_excluded = len(exclude_combinations)
+                logger.info(
+                    f"Moonshine enabled (blacklist mode): {n_total - n_excluded} combinations "
+                    f"({n_excluded} excluded)"
+                )
+            else:
+                logger.info(
+                    f"Moonshine enabled: target={target_date.isoformat()}, "
+                    f"{len(ms_data.get('angular_positions', []))} positions, "
+                    f"{len(ms_data.get('limb_separations', []))} separations"
+                )
 
     def check_observation_schedulable(
         self, obs: Observation, current_time: datetime
