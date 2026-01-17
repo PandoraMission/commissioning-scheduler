@@ -16,10 +16,11 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional, Set, Any
 from collections import defaultdict, deque
 import uuid
+import os
 
 from astropy.time import Time
 
-from .models import (
+from models import (
     Observation,
     ObservationSequence,
     SchedulerConfig,
@@ -28,18 +29,18 @@ from .models import (
     BlockedTimeWindow,
     ContinuousObservationConstraint,
 )
-from .xml_io import ObservationParser, ScheduleWriter
-from .visibility import (
+from xml_io import ObservationParser, ScheduleWriter
+from visibility import (
     VisibilityCalculator,
     find_visible_cvz_pointing,
     compute_antisolar_coordinates,
 )
-from .constraints import (
+from constraints import (
     ConstraintChecker,
     SpecialConstraintHandler,
     Task0312Handler,
 )
-from .utils import (
+from utils import (
     # align_to_minute_boundary,
     format_utc_time,
     parse_utc_time,
@@ -119,6 +120,51 @@ class Scheduler:
         self._schedule_fixed_blocked_time()
         logger.info("✓ Fixed blocked time scheduled")
 
+        # Step 4.5: Initialize Moonshine/Earthshine now that constraints are loaded
+        logger.info(
+            "\n[STEP 4.5/7] Initializing Moonshine/Earthshine components..."
+        )
+        self._initialize_shine_components()
+
+        # Step 4.6: Generate Moonshine/Earthshine observations (NEW)
+        if self.shine_generator:
+            moonshine_template = self._find_template_xml(xml_paths, "0342")
+            earthshine_template = self._find_template_xml(xml_paths, "0341")
+
+            if (
+                moonshine_template
+                and self.config.moonshine_config
+                and self.config.moonshine_config.enabled
+            ):
+                moonshine_obs = (
+                    self.shine_generator.generate_moonshine_observations(
+                        moonshine_template,
+                        Time(self.config.commissioning_start),
+                        Time(self.config.commissioning_end),
+                    )
+                )
+                observations.extend(moonshine_obs)
+                logger.info(
+                    f"✓ Generated {len(moonshine_obs)} Moonshine observations"
+                )
+
+            if (
+                earthshine_template
+                and self.config.earthshine_config
+                and self.config.earthshine_config.enabled
+            ):
+                earthshine_obs = (
+                    self.shine_generator.generate_earthshine_observations(
+                        earthshine_template,
+                        Time(self.config.commissioning_start),
+                        Time(self.config.commissioning_end),
+                    )
+                )
+                observations.extend(earthshine_obs)
+                logger.info(
+                    f"✓ Generated {len(earthshine_obs)} Earthshine observations"
+                )
+
         # Step 4: Compute visibility
         logger.info("\n[STEP 4/7] Computing visibility windows...")
         self._compute_visibility(observations)
@@ -137,6 +183,47 @@ class Scheduler:
         logger.info(
             f"✓ Scheduled {len(observations) - len(unscheduled)}/{len(observations)} observations"
         )
+
+        # Step 5.5: Schedule Moonshine block
+        if self.moonshine_scheduler:
+            moonshine_obs = [
+                o for o in observations if getattr(o, "is_moonshine", False)
+            ]
+            unscheduled_moonshine = [
+                o for o in moonshine_obs if o in unscheduled
+            ]
+
+            if unscheduled_moonshine:
+                logger.info(
+                    f"Scheduling {len(unscheduled_moonshine)} Moonshine observations in block"
+                )
+                moonshine_sequences, still_unscheduled = (
+                    self.moonshine_scheduler.schedule_block(
+                        unscheduled_moonshine,
+                        Time(self.config.commissioning_start),
+                        Time(self.config.commissioning_end),
+                        self.scheduled_sequences,
+                    )
+                )
+
+                # Add scheduled sequences
+                self.scheduled_sequences.extend(moonshine_sequences)
+
+                # Update unscheduled list
+                scheduled_ids = {seq.obs_id for seq in moonshine_sequences}
+                unscheduled = [
+                    o
+                    for o in unscheduled
+                    if not (
+                        getattr(o, "is_moonshine", False)
+                        and o.obs_id in scheduled_ids
+                    )
+                ]
+                unscheduled.extend(still_unscheduled)
+
+                logger.info(
+                    f"Moonshine: scheduled {len(moonshine_sequences)}, unscheduled {len(still_unscheduled)}"
+                )
 
         # Step 6: Fill gaps with CVZ pointings
         logger.info("\n[STEP 6/7] Filling gaps with CVZ idle pointings...")
@@ -178,6 +265,11 @@ class Scheduler:
         parse_errors = []
 
         for xml_path in xml_paths:
+            # Skip template files - they're only used for generating synthetic observations
+            if "_template_" in os.path.basename(xml_path):
+                logger.debug(f"Skipping template file: {xml_path}")
+                continue
+
             try:
                 obs = self.parser.parse_file(
                     xml_path
@@ -298,6 +390,9 @@ class Scheduler:
                     f"Loaded continuous observation constraint: "
                     f"{len(constraint.tasks)} tasks, {len(constraint.observations)} observations"
                 )
+
+            # Load Moonshine/Earthshine constraints
+            self.constraint_checker._load_shine_constraints(constraints_data)
 
         except Exception as e:
             logger.error(
@@ -1934,6 +2029,122 @@ class Scheduler:
             logger.info(f"        {key}: {value}")
 
         return scaled
+
+    def _find_template_xml(
+        self, xml_paths: List[str], task_number: str
+    ) -> Optional[str]:
+        """
+        Find template XML file for given task number.
+
+        Args:
+            xml_paths: List of XML file paths
+            task_number: Task number to search for (e.g., "0341", "0342")
+
+        Returns:
+            Path to template XML, or None if not found
+        """
+        for path in xml_paths:
+            filename = os.path.basename(path)
+            if filename.startswith(
+                f"{task_number}_000_template"
+            ) and filename.endswith(".xml"):
+                logger.info(f"Found template for task {task_number}: {path}")
+                return path
+
+        logger.warning(f"Template XML not found for task {task_number}")
+        return None
+
+    def _initialize_shine_components(self):
+        """
+        Initialize Moonshine/Earthshine components after constraints are loaded.
+
+        This must be called after _load_constraints() so that config.moonshine_config
+        and config.earthshine_config are populated.
+        """
+        self.shine_generator = None
+        self.moonshine_scheduler = None
+        self.earthshine_scheduler = None
+
+        # Create EphemerisProvider for shine calculations (uses same TLE as scheduler)
+        shine_ephemeris = None
+        if (
+            hasattr(self.config, "moonshine_config")
+            and self.config.moonshine_config
+            and self.config.moonshine_config.enabled
+        ) or (
+            hasattr(self.config, "earthshine_config")
+            and self.config.earthshine_config
+            and self.config.earthshine_config.enabled
+        ):
+
+            try:
+                from shine_scheduler import EphemerisProvider
+
+                # Create ephemeris provider using same TLE as scheduler
+                shine_ephemeris = EphemerisProvider(
+                    tle_line1=self.config.tle_line1,
+                    tle_line2=self.config.tle_line2,
+                    gmat_file=None,  # Can add GMAT file support later if needed
+                )
+                logger.info(
+                    "✓ Created EphemerisProvider for Moonshine/Earthshine"
+                )
+
+            except ImportError as e:
+                logger.warning(
+                    f"Could not import shine_scheduler components: {e}"
+                )
+                return
+
+        # Check if Moonshine is enabled
+        if (
+            hasattr(self.config, "moonshine_config")
+            and self.config.moonshine_config
+            and self.config.moonshine_config.enabled
+        ):
+            try:
+                from shine_scheduler import (
+                    ShineObservationGenerator,
+                    MoonshineScheduler,
+                )
+
+                # Use visibility calculator's ephemeris (already initialized)
+                self.shine_generator = ShineObservationGenerator(
+                    self.config, shine_ephemeris
+                )
+                self.moonshine_scheduler = MoonshineScheduler(
+                    self.config, shine_ephemeris
+                )
+                logger.info("✓ Moonshine scheduling enabled")
+            except ImportError as e:
+                logger.warning(
+                    f"Moonshine scheduling requested but shine_scheduler not available: {e}"
+                )
+
+        # Check if Earthshine is enabled
+        if (
+            hasattr(self.config, "earthshine_config")
+            and self.config.earthshine_config
+            and self.config.earthshine_config.enabled
+        ):
+            try:
+                from shine_scheduler import (
+                    ShineObservationGenerator,
+                    EarthshineScheduler,
+                )
+
+                if not self.shine_generator:
+                    self.shine_generator = ShineObservationGenerator(
+                        self.config, shine_ephemeris
+                    )
+
+                # EarthshineScheduler will be implemented in next phase
+                # self.earthshine_scheduler = EarthshineScheduler(...)
+                logger.info("✓ Earthshine scheduling enabled")
+            except ImportError as e:
+                logger.warning(
+                    f"Earthshine scheduling requested but shine_scheduler not available: {e}"
+                )
 
 
 def print_visibility_windows_for_observation(obs: Observation):
