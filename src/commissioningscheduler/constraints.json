@@ -29,10 +29,28 @@
         "enabled": true,
         "target_date": "2026-02-01 00:00:00",
         "window_days": 1.0,
-        "angular_positions": [0, 90, 180, 270],
-        "limb_separations": [10, 15, 20],
+        "angular_positions": [0, 45, 90, 135, 180, 225, 270, 315],
+        "limb_separations": [5, 10, 15, 20],
         "check_moon_visibility": true,
-        "earth_avoidance_deg": 20.0
+        "earth_avoidance_deg": 20.0,
+        "combinations": [
+        {"angular_position": 0, "limb_separation": 10},
+        {"angular_position": 0, "limb_separation": 20},
+        {"angular_position": 45, "limb_separation": 5},
+        {"angular_position": 45, "limb_separation": 15},
+        {"angular_position": 90, "limb_separation": 10},
+        {"angular_position": 90, "limb_separation": 20},
+        {"angular_position": 135, "limb_separation": 5},
+        {"angular_position": 135, "limb_separation": 15},
+        {"angular_position": 180, "limb_separation": 10},
+        {"angular_position": 180, "limb_separation": 20},
+        {"angular_position": 225, "limb_separation": 5},
+        {"angular_position": 225, "limb_separation": 15},
+        {"angular_position": 270, "limb_separation": 10},
+        {"angular_position": 270, "limb_separation": 20},
+        {"angular_position": 315, "limb_separation": 5},
+        {"angular_position": 315, "limb_separation": 15}
+    ]
     },
     "blocked_time": [
         {
