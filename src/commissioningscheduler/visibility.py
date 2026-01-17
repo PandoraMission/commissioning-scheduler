@@ -22,7 +22,7 @@ from astropy.time import Time, TimeDelta
 from astropy.coordinates import SkyCoord, get_sun
 import astropy.units as u
 
-from .models import Observation, SchedulerConfig
+from models import Observation, SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -535,8 +535,8 @@ def find_visible_cvz_pointing(
     start_time: Time,
     end_time: Time,
     initial_dec: float = 8.5,
-    ra_step: float = 1.0,
-    max_iterations: int = 180,
+    ra_step: float = 0.2,
+    max_iterations: int = 100,
     skip_visibility_check: bool = False,
 ) -> Optional[Tuple[float, float]]:
     """
