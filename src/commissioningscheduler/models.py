@@ -63,6 +63,18 @@ class Observation:
     # Metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Shine-specific fields
+    is_earthshine: bool = False
+    is_moonshine: bool = False
+    is_template: bool = False
+    orbital_position_deg: Optional[float] = None  # For Earthshine
+    angular_position_deg: Optional[float] = None  # For Moonshine
+    limb_separation_deg: Optional[float] = None
+    max_orbital_drift_deg: Optional[float] = None  # For Earthshine
+    calculated_duration_minutes: Optional[float] = (
+        None  # Calculated from XML params
+    )
+
     def __post_init__(self):
         """Validate and compute derived values."""
         # Validate coordinates if provided
@@ -189,6 +201,45 @@ class Visit:
 
 
 @dataclass
+class EarthshineConfig:
+    """Configuration for Earthshine observations."""
+
+    enabled: bool = False
+    orbital_positions: List[float] = field(
+        default_factory=lambda: [0, 90, 180, 270]
+    )
+    limb_separations: List[float] = field(
+        default_factory=lambda: [5, 10, 15, 20]
+    )
+    max_orbital_drift_deg: float = 30.0
+    scheduling_mode: str = "flexible"  # or "block"
+    block_priority: str = "medium"
+    template_xml_path: Optional[str] = (
+        None  # Path to 0341_000_template_SOC.xml
+    )
+
+
+@dataclass
+class MoonshineConfig:
+    """Configuration for Moonshine observations."""
+
+    enabled: bool = False
+    target_date: Optional[datetime] = None  # Full Moon date
+    window_days: float = 3.0  # Flexibility around target date
+    angular_positions: List[float] = field(
+        default_factory=lambda: [0, 45, 90, 135, 180, 225, 270, 315]
+    )
+    limb_separations: List[float] = field(
+        default_factory=lambda: [5, 10, 15, 20]
+    )
+    check_moon_visibility: bool = True
+    earth_avoidance_deg: float = 20.0
+    template_xml_path: Optional[str] = (
+        None  # Path to 0342_000_template_SOC.xml
+    )
+
+
+@dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
 
@@ -243,6 +294,10 @@ class SchedulerConfig:
     enable_gap_filling: bool = (
         True  # If True, try to schedule science observations in gaps
     )
+
+    # Shine configurations
+    earthshine_config: Optional[EarthshineConfig] = None
+    moonshine_config: Optional[MoonshineConfig] = None
 
     def __post_init__(self):
         """Validate configuration and set up cache directory."""
