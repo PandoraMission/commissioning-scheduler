@@ -126,23 +126,25 @@ class ShineObservationGenerator:
         ms_config = self.config.moonshine_config
         sequence_num = 0
 
-        for angular_pos in ms_config.angular_positions:
-            for limb_sep in ms_config.limb_separations:
-                obs = self._create_moonshine_observation(
-                    template,
-                    angular_pos,
-                    limb_sep,
-                    duration_minutes,
-                    sequence_num,
-                )
-                observations.append(obs)
-                sequence_num += 1
+        # Determine which combinations to generate
+        combinations_to_generate = self._get_moonshine_combinations(ms_config)
 
         logger.info(
-            f"Generated {len(observations)} Moonshine observations "
-            f"({len(ms_config.angular_positions)} positions × "
-            f"{len(ms_config.limb_separations)} separations)"
+            f"Generating {len(combinations_to_generate)} Moonshine combinations"
         )
+
+        for angular_pos, limb_sep in combinations_to_generate:
+            obs = self._create_moonshine_observation(
+                template,
+                angular_pos,
+                limb_sep,
+                duration_minutes,
+                sequence_num,
+            )
+            observations.append(obs)
+            sequence_num += 1
+
+        logger.info(f"Generated {len(observations)} Moonshine observations")
 
         return observations
 
@@ -281,6 +283,71 @@ class ShineObservationGenerator:
         duration_minutes = math.ceil(total_duration_sec / 60.0)
 
         return duration_minutes
+
+    def _get_moonshine_combinations(
+        self, ms_config: MoonshineConfig
+    ) -> List[Tuple[float, float]]:
+        """
+        Determine which Moonshine combinations to generate based on config.
+
+        Supports three modes:
+        1. Whitelist: Use explicit combinations list
+        2. Blacklist: Generate all combos, then remove exclusions
+        3. Default: Generate all combos from positions × separations
+
+        Args:
+            ms_config: Moonshine configuration
+
+        Returns:
+            List of (angular_position, limb_separation) tuples
+        """
+        # Mode 1: Whitelist - use explicit combinations
+        if ms_config.combinations is not None:
+            logger.info(
+                "Using whitelist mode: explicit combinations specified"
+            )
+            combinations = [
+                (combo["angular_position"], combo["limb_separation"])
+                for combo in ms_config.combinations
+            ]
+            return combinations
+
+        # Mode 2 & 3: Generate all combinations from positions × separations
+        all_combinations = [
+            (angular_pos, limb_sep)
+            for angular_pos in ms_config.angular_positions
+            for limb_sep in ms_config.limb_separations
+        ]
+
+        # Mode 2: Blacklist - remove exclusions
+        if ms_config.exclude_combinations is not None:
+            logger.info(
+                f"Using blacklist mode: excluding {len(ms_config.exclude_combinations)} combinations"
+            )
+
+            # Convert exclusions to set of tuples for fast lookup
+            exclusions = {
+                (excl["angular_position"], excl["limb_separation"])
+                for excl in ms_config.exclude_combinations
+            }
+
+            # Filter out excluded combinations
+            filtered_combinations = [
+                combo for combo in all_combinations if combo not in exclusions
+            ]
+
+            logger.info(
+                f"Filtered {len(all_combinations)} combinations down to {len(filtered_combinations)} "
+                f"(excluded {len(all_combinations) - len(filtered_combinations)})"
+            )
+
+            return filtered_combinations
+
+        # Mode 3: Default - return all combinations
+        logger.info(
+            "Using default mode: all position × separation combinations"
+        )
+        return all_combinations
 
     def _create_moonshine_observation(
         self,
