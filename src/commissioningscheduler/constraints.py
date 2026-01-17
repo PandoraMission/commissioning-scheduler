@@ -20,13 +20,15 @@ from enum import Enum
 from astropy.time import Time
 import astropy.units as u
 
-from .models import (
+from models import (
     Observation,
     ObservationSequence,
     SchedulerConfig,
     ContinuousObservationConstraint,
+    EarthshineConfig,
+    MoonshineConfig,
 )
-from .utils import calculate_angular_separation, compute_data_volume_gb
+from utils import calculate_angular_separation, compute_data_volume_gb
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +126,70 @@ class ConstraintChecker:
                 )
             )
 
+        # Load shine constraints
+        self._load_shine_constraints(data)
+
     def requires_continuous_scheduling(self, obs: Observation) -> bool:
         """Check if observation must be scheduled continuously."""
         return any(c.applies_to(obs) for c in self.continuous_constraints)
+
+    def _load_shine_constraints(self, data: Dict[str, Any]):
+        """
+        Load Earthshine and Moonshine configuration from constraints JSON.
+
+        Args:
+            data: Parsed JSON data from constraints file
+        """
+        from utils import parse_utc_time  # Assuming this utility exists
+
+        # Load Earthshine config
+        if "earthshine" in data:
+            es_data = data["earthshine"]
+            self.config.earthshine_config = EarthshineConfig(
+                enabled=es_data.get("enabled", False),
+                orbital_positions=es_data.get(
+                    "orbital_positions", [0, 90, 180, 270]
+                ),
+                limb_separations=es_data.get(
+                    "limb_separations", [5, 10, 15, 20]
+                ),
+                max_orbital_drift_deg=es_data.get(
+                    "max_orbital_drift_deg", 30.0
+                ),
+                scheduling_mode=es_data.get("scheduling_mode", "flexible"),
+                block_priority=es_data.get("block_priority", "medium"),
+            )
+            logger.info(
+                f"Earthshine enabled: {len(es_data.get('orbital_positions', []))} positions, "
+                f"{len(es_data.get('limb_separations', []))} separations"
+            )
+
+        # Load Moonshine config
+        if "moonshine" in data:
+            ms_data = data["moonshine"]
+            target_date_str = ms_data.get("target_date", "2026-02-01 00:00:00")
+            target_date = parse_utc_time(target_date_str)
+
+            self.config.moonshine_config = MoonshineConfig(
+                enabled=ms_data.get("enabled", False),
+                target_date=target_date,
+                window_days=ms_data.get("window_days", 3.0),
+                angular_positions=ms_data.get(
+                    "angular_positions", [0, 45, 90, 135, 180, 225, 270, 315]
+                ),
+                limb_separations=ms_data.get(
+                    "limb_separations", [5, 10, 15, 20]
+                ),
+                check_moon_visibility=ms_data.get(
+                    "check_moon_visibility", True
+                ),
+                earth_avoidance_deg=ms_data.get("earth_avoidance_deg", 20.0),
+            )
+            logger.info(
+                f"Moonshine enabled: target={target_date.isoformat()}, "
+                f"{len(ms_data.get('angular_positions', []))} positions, "
+                f"{len(ms_data.get('limb_separations', []))} separations"
+            )
 
     def check_observation_schedulable(
         self, obs: Observation, current_time: datetime
