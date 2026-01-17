@@ -5,7 +5,10 @@ Example usage of the commissioning scheduler.
 
 from datetime import datetime
 import logging
-from commissioningscheduler import schedule_observations, analyze_schedule_diagnostics
+from commissioningscheduler import (
+    schedule_observations,
+    analyze_schedule_diagnostics,
+)
 
 import xml.etree.ElementTree as ET
 import os
@@ -16,8 +19,8 @@ from astropy.time import Time
 # Configure logging for verbose output
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
 # Configuration
@@ -26,19 +29,20 @@ output_path = "./master_schedule.xml"
 cvz_coords = (120.0, 8.5)
 
 # TLE (Two-Line Element set for satellite orbit)
-# tle1 = "1 99152U 26011B   26005.66013674 +.00000000 +00000-0 +00000-0 0    16"
-# tle2 = "2 99152  97.6750  17.6690 0000000 328.8990  20.9640 14.86530781000004"
-tle1 = "1 99152U 80229J   26014.83069444  .00000000  00000-0  37770-3 0    08"
-tle2 = "2 99152  97.8005  15.9441 0003693 273.7015  26.6009 14.87738574    04"
+# tle1 = "1 99152U 80229J   26014.83069444  .00000000  00000-0  37770-3 0    08"
+# tle2 = "2 99152  97.8005  15.9441 0003693 273.7015  26.6009 14.87738574    04"
+tle1 = "1 99152U 80229J   26016.78137731  .00000000  00000-0  37770-3 0    09"
+tle2 = "2 99152  97.8007  17.8633 0003782 264.7640  36.6165 14.87739073    02"
+
 
 # Commissioning period
-commissioning_start = datetime(2026, 1, 21, 0, 0)
+commissioning_start = datetime(2026, 1, 21, 8, 0)
 commissioning_end = datetime(2026, 2, 11, 0, 0)
 
 # Run scheduler
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("COMMISSIONING SCHEDULER")
-print("="*80 + "\n")
+print("=" * 80 + "\n")
 
 result = schedule_observations(
     xml_dir=xml_dir,
@@ -51,12 +55,12 @@ result = schedule_observations(
     constraints_json="constraints.json",
     max_data_volume_gb=150.0,
     verify_cvz_visibility=False,  # Set to False for faster debugging
-    enable_gap_filling=True  # Try to schedule science in gaps
+    enable_gap_filling=True,  # Try to schedule science in gaps
 )
 
 print(f"\n{'='*80}")
 print("SCHEDULING SUMMARY")
-print("="*80)
+print("=" * 80)
 print(f"Success: {result.success}")
 print(f"Message: {result.message}")
 print(f"Visits: {len(result.visits)}")
@@ -76,12 +80,12 @@ if result.unscheduled_observations:
     for obs in result.unscheduled_observations:
         print(f"  - {obs.obs_id}: {obs.target_name}")
 
-print("="*80 + "\n")
+print("=" * 80 + "\n")
 
 # Run diagnostics
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("RUNNING DIAGNOSTICS")
-print("="*80 + "\n")
+print("=" * 80 + "\n")
 
 diagnostics = analyze_schedule_diagnostics(
     sequences=result.scheduled_sequences,
@@ -89,10 +93,16 @@ diagnostics = analyze_schedule_diagnostics(
     dependency_json="constraints.json",
     print_report=True,
     save_report="schedule_diagnostics.txt",
-    detailed=True
+    detailed=True,
 )
 
 print(f"\nDiagnostics Summary:")
-print(f"  Validation Errors: {sum(1 for i in diagnostics.validation_issues if i.severity == 'error')}")
-print(f"  Validation Warnings: {sum(1 for i in diagnostics.validation_issues if i.severity == 'warning')}")
-print(f"  Overall Status: {'✓ PASS' if not diagnostics.has_errors else '✗ FAIL'}")
+print(
+    f"  Validation Errors: {sum(1 for i in diagnostics.validation_issues if i.severity == 'error')}"
+)
+print(
+    f"  Validation Warnings: {sum(1 for i in diagnostics.validation_issues if i.severity == 'warning')}"
+)
+print(
+    f"  Overall Status: {'✓ PASS' if not diagnostics.has_errors else '✗ FAIL'}"
+)
