@@ -5,7 +5,7 @@ Commissioning Scheduler Package
 A modular scheduling system for space telescope observations.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .models import (
     Observation,
