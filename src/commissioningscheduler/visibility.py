@@ -23,6 +23,7 @@ from astropy.coordinates import SkyCoord, get_sun
 import astropy.units as u
 
 from .models import Observation, SchedulerConfig
+from .shine_scheduler import EphemerisProvider, EarthshinePointing
 
 logger = logging.getLogger(__name__)
 
@@ -528,6 +529,115 @@ class VisibilityCalculator:
         # Consider visible if >80% of points are visible
         visibility_fraction = np.sum(window_visible) / len(window_visible)
         return visibility_fraction > 0.8
+
+    def compute_earthshine_visibility(
+        self, observations: List[Observation], force_recompute: bool = False
+    ) -> None:
+        """
+        Compute visibility for Earthshine observations based on orbital position.
+
+        For Earthshine, "visibility" means the spacecraft is at the required
+        orbital position (not that a sky coordinate is visible).
+
+        Args:
+            observations: List of Earthshine observations
+            force_recompute: Force recomputation
+        """
+        from .shine_scheduler import EphemerisProvider, EarthshinePointing
+
+        # Filter for Earthshine observations only
+        earthshine_obs = [
+            o for o in observations if getattr(o, "is_earthshine", False)
+        ]
+
+        if not earthshine_obs:
+            return
+
+        logger.info(
+            f"Computing orbital position visibility for {len(earthshine_obs)} Earthshine observations"
+        )
+
+        # Create ephemeris provider (reuse TLE from config)
+        ephemeris = EphemerisProvider(
+            tle_line1=self.config.tle_line1, tle_line2=self.config.tle_line2
+        )
+
+        earthshine_calc = EarthshinePointing(ephemeris)
+
+        # For each Earthshine observation, find when spacecraft is at its orbital position
+        for obs in earthshine_obs:
+            orbital_pos = obs.orbital_position_deg
+            max_drift = obs.max_orbital_drift_deg
+            duration_minutes = (
+                obs.calculated_duration_minutes or obs.duration or 0.0
+            )
+
+            logger.info(
+                f"Computing orbital visibility for {obs.obs_id}: "
+                f"position={orbital_pos}°, max_drift={max_drift}°"
+            )
+
+            # Find all times in our time grid when spacecraft is at this position
+            windows = self._find_orbital_position_windows(
+                earthshine_calc, orbital_pos, max_drift, duration_minutes
+            )
+
+            # Attach windows to observation
+            obs.visibility_windows = [
+                (w.start.datetime, w.end.datetime) for w in windows
+            ]
+
+            total_time = sum(w.duration_minutes for w in windows)
+            logger.info(
+                f"  Found {len(windows)} windows for {obs.obs_id}, "
+                f"total {total_time:.1f} minutes"
+            )
+
+    def _find_orbital_position_windows(
+        self,
+        earthshine_calc: EarthshinePointing,
+        target_position_deg: float,
+        tolerance_deg: float,
+        min_duration_minutes: float,
+    ) -> List[VisibilityWindow]:
+        """
+        Find time windows when spacecraft is at target orbital position.
+
+        Args:
+            earthshine_calc: EarthshinePointing calculator
+            target_position_deg: Target orbital position (0-360)
+            tolerance_deg: Position tolerance
+            min_duration_minutes: Minimum window duration
+
+        Returns:
+            List of VisibilityWindow objects
+        """
+        # Check orbital position at each time step
+        at_position = np.zeros(len(self.times), dtype=bool)
+
+        for i, time in enumerate(self.times):
+            # Get spacecraft state
+            sc_state = earthshine_calc.ephemeris.get_spacecraft_state(time)
+
+            # Get orbital position
+            current_position = earthshine_calc._get_orbital_position(sc_state)
+
+            # Check if within tolerance
+            delta = abs(current_position - target_position_deg)
+            if delta > 180:
+                delta = 360 - delta
+
+            at_position[i] = delta <= tolerance_deg
+
+        # Extract windows using existing method
+        windows = self._extract_windows(at_position)
+
+        # Filter by minimum duration
+        windows = [
+            w for w in windows if w.duration_minutes >= min_duration_minutes
+        ]
+
+        return windows
 
 
 def find_visible_cvz_pointing(
