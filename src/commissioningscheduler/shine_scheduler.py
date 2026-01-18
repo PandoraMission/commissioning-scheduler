@@ -187,23 +187,25 @@ class ShineObservationGenerator:
         es_config = self.config.earthshine_config
         sequence_num = 0
 
-        for orbital_pos in es_config.orbital_positions:
-            for limb_sep in es_config.limb_separations:
-                obs = self._create_earthshine_observation(
-                    template,
-                    orbital_pos,
-                    limb_sep,
-                    duration_minutes,
-                    sequence_num,
-                )
-                observations.append(obs)
-                sequence_num += 1
+        # Determine which combinations to generate
+        combinations_to_generate = self._get_earthshine_combinations(es_config)
 
         logger.info(
-            f"Generated {len(observations)} Earthshine observations "
-            f"({len(es_config.orbital_positions)} positions × "
-            f"{len(es_config.limb_separations)} separations)"
+            f"Generating {len(combinations_to_generate)} Earthshine combinations"
         )
+
+        for orbital_pos, limb_sep in combinations_to_generate:
+            obs = self._create_earthshine_observation(
+                template,
+                orbital_pos,
+                limb_sep,
+                duration_minutes,
+                sequence_num,
+            )
+            observations.append(obs)
+            sequence_num += 1
+
+        logger.info(f"Generated {len(observations)} Earthshine observations")
 
         return observations
 
@@ -376,7 +378,7 @@ class ShineObservationGenerator:
         obs.obs_id = f"0342_{sequence_num:03d}"
         obs.task_number = "0342"
         obs.target_name = (
-            f"Moonshine_Pos{angular_position:.0f}_Sep{limb_separation:.0f}"
+            f"Mshine_Pos{angular_position:.0f}_Sep{limb_separation:.0f}"
         )
 
         # Set shine-specific fields
@@ -396,6 +398,71 @@ class ShineObservationGenerator:
         )
 
         return obs
+
+    def _get_earthshine_combinations(
+        self, es_config: EarthshineConfig
+    ) -> List[Tuple[float, float]]:
+        """
+        Determine which Earthshine combinations to generate based on config.
+
+        Supports three modes:
+        1. Whitelist: Use explicit combinations list
+        2. Blacklist: Generate all combos, then remove exclusions
+        3. Default: Generate all combos from positions × separations
+
+        Args:
+            es_config: Earthshine configuration
+
+        Returns:
+            List of (orbital_position, limb_separation) tuples
+        """
+        # Mode 1: Whitelist - use explicit combinations
+        if es_config.combinations is not None:
+            logger.info(
+                "Using whitelist mode: explicit combinations specified"
+            )
+            combinations = [
+                (combo["orbital_position"], combo["limb_separation"])
+                for combo in es_config.combinations
+            ]
+            return combinations
+
+        # Mode 2 & 3: Generate all combinations from positions × separations
+        all_combinations = [
+            (orbital_pos, limb_sep)
+            for orbital_pos in es_config.orbital_positions
+            for limb_sep in es_config.limb_separations
+        ]
+
+        # Mode 2: Blacklist - remove exclusions
+        if es_config.exclude_combinations is not None:
+            logger.info(
+                f"Using blacklist mode: excluding {len(es_config.exclude_combinations)} combinations"
+            )
+
+            # Convert exclusions to set of tuples for fast lookup
+            exclusions = {
+                (excl["orbital_position"], excl["limb_separation"])
+                for excl in es_config.exclude_combinations
+            }
+
+            # Filter out excluded combinations
+            filtered_combinations = [
+                combo for combo in all_combinations if combo not in exclusions
+            ]
+
+            logger.info(
+                f"Filtered {len(all_combinations)} combinations down to {len(filtered_combinations)} "
+                f"(excluded {len(all_combinations) - len(filtered_combinations)})"
+            )
+
+            return filtered_combinations
+
+        # Mode 3: Default - return all combinations
+        logger.info(
+            "Using default mode: all position × separation combinations"
+        )
+        return all_combinations
 
     def _create_earthshine_observation(
         self,
@@ -424,7 +491,7 @@ class ShineObservationGenerator:
         obs.obs_id = f"0341_{sequence_num:03d}"
         obs.task_number = "0341"
         obs.target_name = (
-            f"Earthshine_OrbPos{orbital_position:.0f}_Sep{limb_separation:.0f}"
+            f"Eshine_Pos{orbital_position:.0f}_Sep{limb_separation:.0f}"
         )
 
         # Set shine-specific fields
@@ -744,7 +811,6 @@ class MoonshineScheduler:
                     check_earth_blockage=self.config.moonshine_config.check_moon_visibility,
                     earth_avoidance_deg=self.config.moonshine_config.earth_avoidance_deg,
                 )
-                print(result)
 
                 # Check if Moon is visible (not occluded by Earth)
                 if not result.moon_visible:
