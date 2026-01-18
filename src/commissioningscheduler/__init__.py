@@ -5,7 +5,7 @@ Commissioning Scheduler Package
 A modular scheduling system for space telescope observations.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .models import (
     Observation,
@@ -13,6 +13,8 @@ from .models import (
     Visit,
     SchedulerConfig,
     SchedulingResult,
+    EarthshineConfig,
+    MoonshineConfig,
 )
 from .scheduler import Scheduler
 from .xml_io import ObservationParser, ScheduleWriter, gather_task_xmls
@@ -25,6 +27,13 @@ from .visibility import (
 )
 from .constraints import ConstraintChecker, SpecialConstraintHandler
 from .diagnostics import analyze_schedule_diagnostics, print_diagnostics_report
+from .shine import (
+    EphemerisProvider,
+    MoonshinePointing,
+    EarthshinePointing,
+    MoonshineResult,
+    EarthshineResult,
+)
 
 __all__ = [
     "Observation",
@@ -45,6 +54,13 @@ __all__ = [
     "SpecialConstraintHandler",
     "analyze_schedule_diagnostics",
     "print_diagnostics_report",
+    "EarthshineConfig",
+    "MoonshineConfig",
+    "EphemerisProvider",
+    "MoonshinePointing",
+    "EarthshinePointing",
+    "MoonshineResult",
+    "EarthshineResult",
 ]
 
 

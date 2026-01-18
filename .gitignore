@@ -15,7 +15,9 @@ src/commissioningscheduler/old
 src/commissioningscheduler/~
 src/commissioningscheduler/ip_scheduler
 src/commissioningscheduler/master_schedule.xml
-src/commissioningscheduler/test_run.py
+src/commissioningscheduler/*test*.py
+src/commissioningscheduler/test*.xml
+docs/test_shine.py
 old/
 
 # Mac things

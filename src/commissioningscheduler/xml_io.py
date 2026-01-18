@@ -697,11 +697,11 @@ class ScheduleWriter:
         # Standard parameters for CVZ or visible acquisition
         # Using the correct CVZ command structure
         ET.SubElement(vis_block, "IncludeFieldSolnsInResp").text = "1"
-        ET.SubElement(vis_block, "ROI_StartX").text = "512"
-        ET.SubElement(vis_block, "ROI_StartY").text = "512"
-        ET.SubElement(vis_block, "ROI_SizeX").text = "1024"
-        ET.SubElement(vis_block, "ROI_SizeY").text = "1024"
-        ET.SubElement(vis_block, "MaxMagnitudeInQuadCatalog").text = "15.5"
+        ET.SubElement(vis_block, "ROI_StartX").text = "384"
+        ET.SubElement(vis_block, "ROI_StartY").text = "384"
+        ET.SubElement(vis_block, "ROI_SizeX").text = "1280"
+        ET.SubElement(vis_block, "ROI_SizeY").text = "1280"
+        ET.SubElement(vis_block, "MaxMagnitudeInQuadCatalog").text = "16.5"
         ET.SubElement(vis_block, "SaveImagesToDisk").text = "1"
         ET.SubElement(vis_block, "RiceX").text = "5"
         ET.SubElement(vis_block, "RiceY").text = "25"
@@ -731,7 +731,7 @@ class ScheduleWriter:
         ET.SubElement(vis_block, "FramesPerCoadd").text = "50"
         ET.SubElement(vis_block, "ExposureTime_us").text = "200000"
         ET.SubElement(vis_block, "MaxNumStarRois").text = "1"
-        ET.SubElement(vis_block, "StarRoiDimension").text = "256"
+        ET.SubElement(vis_block, "StarRoiDimension").text = "1280"
         ET.SubElement(vis_block, "NumTotalFramesRequested").text = "50"
 
         logger.debug(
@@ -963,11 +963,11 @@ class ScheduleWriter:
 
         # Standard 50-frame visible parameters (same as CVZ)
         ET.SubElement(vis_block, "IncludeFieldSolnsInResp").text = "1"
-        ET.SubElement(vis_block, "ROI_StartX").text = "512"
-        ET.SubElement(vis_block, "ROI_StartY").text = "512"
-        ET.SubElement(vis_block, "ROI_SizeX").text = "1024"
-        ET.SubElement(vis_block, "ROI_SizeY").text = "1024"
-        ET.SubElement(vis_block, "MaxMagnitudeInQuadCatalog").text = "15.5"
+        ET.SubElement(vis_block, "ROI_StartX").text = "384"
+        ET.SubElement(vis_block, "ROI_StartY").text = "384"
+        ET.SubElement(vis_block, "ROI_SizeX").text = "1280"
+        ET.SubElement(vis_block, "ROI_SizeY").text = "1280"
+        ET.SubElement(vis_block, "MaxMagnitudeInQuadCatalog").text = "16.5"
         ET.SubElement(vis_block, "SaveImagesToDisk").text = "1"
         ET.SubElement(vis_block, "RiceX").text = "5"
         ET.SubElement(vis_block, "RiceY").text = "25"
@@ -993,7 +993,7 @@ class ScheduleWriter:
         ET.SubElement(vis_block, "FramesPerCoadd").text = "50"
         ET.SubElement(vis_block, "ExposureTime_us").text = "200000"
         ET.SubElement(vis_block, "MaxNumStarRois").text = "1"
-        ET.SubElement(vis_block, "StarRoiDimension").text = "256"
+        ET.SubElement(vis_block, "StarRoiDimension").text = "1280"
         ET.SubElement(vis_block, "NumTotalFramesRequested").text = "50"
 
         return obs_seq_elem
