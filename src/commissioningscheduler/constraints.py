@@ -20,7 +20,7 @@ from enum import Enum
 from astropy.time import Time
 import astropy.units as u
 
-from models import (
+from .models import (
     Observation,
     ObservationSequence,
     SchedulerConfig,
@@ -28,7 +28,7 @@ from models import (
     EarthshineConfig,
     MoonshineConfig,
 )
-from utils import calculate_angular_separation, compute_data_volume_gb
+from .utils import calculate_angular_separation, compute_data_volume_gb
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ class ConstraintChecker:
         Args:
             data: Parsed JSON data from constraints file
         """
-        from utils import parse_utc_time  # Assuming this utility exists
+        from .utils import parse_utc_time  # Assuming this utility exists
 
         # Load Earthshine config
         if "earthshine" in data:

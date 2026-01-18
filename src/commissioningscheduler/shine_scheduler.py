@@ -21,19 +21,19 @@ import copy
 from astropy.time import Time
 import astropy.units as u
 
-from models import (
+from .models import (
     Observation,
     ObservationSequence,
     SchedulerConfig,
     EarthshineConfig,
     MoonshineConfig,
 )
-from xml_io import ObservationParser
-from utils import parse_utc_time, format_utc_time
+from .xml_io import ObservationParser
+from .utils import parse_utc_time, format_utc_time
 
 # Import our shine pointing code
 try:
-    from shine import (
+    from .shine import (
         EphemerisProvider,
         MoonshinePointing,
         EarthshinePointing,
@@ -883,7 +883,7 @@ class MoonshineScheduler:
         Returns:
             ObservationSequence object
         """
-        from models import ObservationSequence
+        from .models import ObservationSequence
 
         sequence = ObservationSequence(
             obs_id=obs.obs_id,

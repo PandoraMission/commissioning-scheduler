@@ -22,7 +22,7 @@ from astropy.time import Time, TimeDelta
 from astropy.coordinates import SkyCoord, get_sun
 import astropy.units as u
 
-from models import Observation, SchedulerConfig
+from .models import Observation, SchedulerConfig
 
 logger = logging.getLogger(__name__)
 

@@ -20,7 +20,7 @@ import os
 
 from astropy.time import Time
 
-from models import (
+from .models import (
     Observation,
     ObservationSequence,
     SchedulerConfig,
@@ -29,18 +29,18 @@ from models import (
     BlockedTimeWindow,
     ContinuousObservationConstraint,
 )
-from xml_io import ObservationParser, ScheduleWriter
-from visibility import (
+from .xml_io import ObservationParser, ScheduleWriter
+from .visibility import (
     VisibilityCalculator,
     find_visible_cvz_pointing,
     compute_antisolar_coordinates,
 )
-from constraints import (
+from .constraints import (
     ConstraintChecker,
     SpecialConstraintHandler,
     Task0312Handler,
 )
-from utils import (
+from .utils import (
     # align_to_minute_boundary,
     format_utc_time,
     parse_utc_time,
@@ -2078,7 +2078,7 @@ class Scheduler:
         ):
 
             try:
-                from shine_scheduler import EphemerisProvider
+                from .shine_scheduler import EphemerisProvider
 
                 # Create ephemeris provider using same TLE as scheduler
                 shine_ephemeris = EphemerisProvider(
@@ -2103,7 +2103,7 @@ class Scheduler:
             and self.config.moonshine_config.enabled
         ):
             try:
-                from shine_scheduler import (
+                from .shine_scheduler import (
                     ShineObservationGenerator,
                     MoonshineScheduler,
                 )
@@ -2128,7 +2128,7 @@ class Scheduler:
             and self.config.earthshine_config.enabled
         ):
             try:
-                from shine_scheduler import (
+                from .shine_scheduler import (
                     ShineObservationGenerator,
                     EarthshineScheduler,
                 )

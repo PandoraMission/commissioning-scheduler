@@ -10,13 +10,13 @@ import datetime
 
 from astropy.time import Time
 
-from models import Observation, ObservationSequence, Visit, SchedulerConfig
-from utils import (
+from .models import Observation, ObservationSequence, Visit, SchedulerConfig
+from .utils import (
     # parse_utc_time,
     format_utc_time,
     # compute_data_volume_gb
 )
-from roll import calculate_roll
+from .roll import calculate_roll
 
 logger = logging.getLogger(__name__)
 
