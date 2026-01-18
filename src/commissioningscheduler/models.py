@@ -218,6 +218,23 @@ class EarthshineConfig:
         None  # Path to 0341_000_template_SOC.xml
     )
 
+    # Fine-grained control over combinations
+    combinations: Optional[List[Dict[str, float]]] = None  # Whitelist mode
+    exclude_combinations: Optional[List[Dict[str, float]]] = (
+        None  # Blacklist mode
+    )
+
+    def __post_init__(self):
+        """Validate configuration."""
+        if (
+            self.combinations is not None
+            and self.exclude_combinations is not None
+        ):
+            raise ValueError(
+                "Cannot specify both 'combinations' and 'exclude_combinations'. "
+                "Use one or the other."
+            )
+
 
 @dataclass
 class MoonshineConfig:
