@@ -2177,6 +2177,22 @@ class Scheduler:
         logger.info(f"    Orbital position: {obs.orbital_position_deg}°")
         logger.info(f"    Limb separation: {obs.limb_separation_deg}°")
 
+        # Check dependencies FIRST
+        task_id = obs.task_number
+
+        if task_id and task_id in self.dependencies:
+            prereqs = self.dependencies[task_id]
+            print(prereqs)
+            missing_prereqs = [
+                p for p in prereqs if p not in self.completed_tasks
+            ]
+
+            if missing_prereqs:
+                logger.warning(
+                    f"    Cannot schedule {obs.obs_id}: missing prerequisites {missing_prereqs}"
+                )
+                return False
+
         # Check if shine_generator is available
         if (
             not hasattr(self, "shine_generator")
@@ -2198,7 +2214,6 @@ class Scheduler:
                     ),  # Start no earlier than current time
                     window_end,
                 )
-                break
 
         if not next_window:
             logger.warning("    No future orbital position windows available")
@@ -2291,8 +2306,8 @@ class Scheduler:
                 boresight_dec=result.dec_deg,
                 priority=obs.priority,
                 science_duration_minutes=duration_minutes,
-                nir_duration_minutes=obs.nir_duration_minutes,
-                vis_duration_minutes=obs.visible_duration_minutes,
+                nir_duration_minutes=obs.nir_duration,
+                vis_duration_minutes=obs.visible_duration,
                 raw_xml_tree=obs.raw_xml_tree,
             )
 
