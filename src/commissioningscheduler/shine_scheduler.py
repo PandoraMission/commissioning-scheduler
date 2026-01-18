@@ -20,6 +20,7 @@ import copy
 
 from astropy.time import Time
 import astropy.units as u
+import numpy as np
 
 from .models import (
     Observation,
@@ -845,9 +846,7 @@ class MoonshineScheduler:
             except Exception as e:
                 logger.error(f"Error scheduling {obs.obs_id}: {e}")
                 occluded.append(obs)
-                blah
                 continue
-            # blah
 
         return scheduled, occluded
 
@@ -966,6 +965,396 @@ class MoonshineScheduler:
             science_duration_minutes=obs.calculated_duration_minutes,
             nir_duration_minutes=obs.nir_duration,
             vis_duration_minutes=obs.visible_duration,
+        )
+
+        return sequence
+
+
+class EarthshineScheduler:
+    """
+    Schedules Earthshine observations in block mode.
+
+    Block mode schedules all Earthshine observations in a contiguous time block,
+    with potential gaps between observations while waiting for the spacecraft
+    to reach the next required orbital position.
+    """
+
+    def __init__(
+        self,
+        config: SchedulerConfig,
+        ephemeris_provider: EphemerisProvider,
+        scheduler_ref=None,
+    ):
+        """
+        Initialize Earthshine block scheduler.
+
+        Args:
+            config: Scheduler configuration
+            ephemeris_provider: Ephemeris provider
+        """
+        self.config = config
+        self.ephemeris = ephemeris_provider
+        self.earthshine_calc = EarthshinePointing(ephemeris_provider)
+        self.scheduler_ref = scheduler_ref
+
+    def schedule_block(
+        self,
+        earthshine_observations: List[Observation],
+        start_time: Time,
+        end_time: Time,
+        existing_schedule: List[ObservationSequence],
+        allow_overflow: bool = True,
+    ) -> Tuple[List[ObservationSequence], List[Observation]]:
+        """
+        Schedule all Earthshine observations in a contiguous block.
+
+        The block starts at the earliest available time and continues until
+        all observations are scheduled. Gaps between observations (while waiting
+        for next orbital position) are filled with CVZ pointings by the main scheduler.
+
+        Args:
+            earthshine_observations: List of Earthshine observations to schedule
+            start_time: Scheduling window start
+            end_time: Scheduling window end
+            existing_schedule: Already scheduled sequences
+            allow_overflow: Allow scheduling beyond end_time if necessary
+
+        Returns:
+            Tuple of (scheduled_sequences, unscheduled_observations)
+        """
+        if not earthshine_observations:
+            return [], []
+
+        es_config = self.config.earthshine_config
+        if not es_config or not es_config.enabled:
+            return [], earthshine_observations
+
+        logger.info(
+            f"Scheduling {len(earthshine_observations)} Earthshine observations in block mode"
+        )
+
+        # Estimate block duration (conservative)
+        block_duration_minutes = self._estimate_block_duration(
+            earthshine_observations
+        )
+        logger.info(
+            f"Earthshine block estimated duration: {block_duration_minutes:.1f} minutes"
+        )
+
+        # Find earliest available block start time
+        block_start_time = self._find_earthshine_block_window(
+            start_time, end_time, block_duration_minutes, existing_schedule
+        )
+
+        if block_start_time is None:
+            if allow_overflow:
+                logger.warning(
+                    "Earthshine block doesn't fit in window, trying overflow"
+                )
+                block_start_time = self._find_earthshine_block_window(
+                    end_time,
+                    end_time + 7 * u.day,
+                    block_duration_minutes,
+                    existing_schedule,
+                )
+
+        if block_start_time is None:
+            logger.error("Could not find suitable window for Earthshine block")
+            return [], earthshine_observations
+
+        # Schedule the block
+        scheduled_sequences = self._schedule_earthshine_block(
+            earthshine_observations, block_start_time, end_time
+        )
+
+        # Determine which observations were scheduled
+        scheduled_ids = {seq.obs_id for seq in scheduled_sequences}
+        unscheduled = [
+            obs
+            for obs in earthshine_observations
+            if obs.obs_id not in scheduled_ids
+        ]
+
+        logger.info(
+            f"Earthshine block: scheduled {len(scheduled_sequences)} sequences, "
+            f"{len(unscheduled)} observations unscheduled"
+        )
+
+        return scheduled_sequences, unscheduled
+
+    def _estimate_block_duration(
+        self, observations: List[Observation]
+    ) -> float:
+        """
+        Estimate total duration for Earthshine block.
+
+        This is conservative - accounts for orbital period between positions.
+
+        Args:
+            observations: List of Earthshine observations
+
+        Returns:
+            Estimated duration in minutes
+        """
+        if not observations:
+            return 0.0
+
+        # Get unique orbital positions
+        unique_positions = set(
+            obs.orbital_position_deg for obs in observations
+        )
+        n_positions = len(unique_positions)
+
+        # Observations per position
+        obs_per_position = (
+            len(observations) / n_positions if n_positions > 0 else 1
+        )
+
+        # Typical observation duration
+        avg_duration = np.mean(
+            [
+                obs.calculated_duration_minutes or obs.duration or 0.0
+                for obs in observations
+            ]
+        )
+
+        # Estimate: Need roughly one orbit per position, plus observation durations
+        orbital_period_minutes = 97.0  # Approximate for LEO
+
+        # Conservative estimate: orbital_period × n_positions + total observation time
+        total_obs_time = sum(
+            obs.calculated_duration_minutes or obs.duration or 0.0
+            for obs in observations
+        )
+
+        # Account for slew overhead
+        slew_overhead = len(observations) * self.config.slew_overhead_minutes
+
+        # Total: observation time + slews (gaps handled naturally by orbital mechanics)
+        estimated_duration = (
+            total_obs_time + slew_overhead + (orbital_period_minutes * 0.5)
+        )
+
+        logger.debug(
+            f"Earthshine block estimate: {total_obs_time:.1f} min obs + "
+            f"{slew_overhead:.1f} min slews + buffer = {estimated_duration:.1f} min"
+        )
+
+        return estimated_duration
+
+    def _find_earthshine_block_window(
+        self,
+        start_time: Time,
+        end_time: Time,
+        duration_minutes: float,
+        existing_schedule: List[ObservationSequence],
+    ) -> Optional[Time]:
+        """
+        Find available time window for Earthshine block.
+
+        Args:
+            start_time: Search start
+            end_time: Search end
+            duration_minutes: Required duration
+            existing_schedule: Existing sequences to avoid
+
+        Returns:
+            Start time for block, or None if not found
+        """
+        logger.info(
+            f"Searching for Earthshine block window: {duration_minutes:.1f} min needed"
+        )
+
+        # Search with 30-minute resolution
+        search_step_minutes = 30.0
+        current_time = start_time
+
+        while current_time <= end_time - duration_minutes * u.min:
+            block_end_time = current_time + duration_minutes * u.min
+
+            # Check if window is free
+            if self._is_window_available(
+                current_time, block_end_time, existing_schedule
+            ):
+                logger.info(
+                    f"Found Earthshine block window: {current_time.iso}"
+                )
+                return current_time
+
+            current_time += search_step_minutes * u.min
+
+        return None
+
+    def _is_window_available(
+        self,
+        start_time: Time,
+        end_time: Time,
+        existing_schedule: List[ObservationSequence],
+    ) -> bool:
+        """Check if time window is available (no conflicts)."""
+        start_dt = start_time.datetime
+        end_dt = end_time.datetime
+
+        for seq in existing_schedule:
+            # Check for overlap
+            if start_dt < seq.stop and end_dt > seq.start:
+                return False
+
+        # Use scheduler's blocked time checking method
+        if self.scheduler_ref is not None and hasattr(
+            self.scheduler_ref, "_is_time_blocked"
+        ):
+            if self.scheduler_ref._is_time_blocked(start_dt, end_dt):
+                logger.debug(f"Window {start_dt} to {end_dt} is blocked")
+                return False
+
+        return True
+
+    def _schedule_earthshine_block(
+        self,
+        observations: List[Observation],
+        block_start_time: Time,
+        end_time: Time,
+    ) -> List[ObservationSequence]:
+        """
+        Schedule Earthshine observations within the block.
+
+        Observations are scheduled at the next occurrence of their required
+        orbital position after the previous observation completes.
+
+        Args:
+            observations: List of Earthshine observations
+            block_start_time: When to start the block
+            end_time: Latest allowed end time
+
+        Returns:
+            List of scheduled ObservationSequence objects
+        """
+        scheduled = []
+        current_time = block_start_time
+
+        # Sort observations by orbital position for logical ordering
+        sorted_obs = sorted(
+            observations,
+            key=lambda o: (o.orbital_position_deg, o.limb_separation_deg),
+        )
+
+        logger.info(
+            f"Scheduling Earthshine block starting at {current_time.iso}"
+        )
+
+        for i, obs in enumerate(sorted_obs):
+            logger.info(
+                f"  Scheduling Earthshine {obs.obs_id} "
+                f"(pos={obs.orbital_position_deg}°, sep={obs.limb_separation_deg}°)"
+            )
+
+            try:
+                # Find next time when spacecraft is at required orbital position
+                result = self.earthshine_calc.calculate_pointing(
+                    current_time,
+                    obs.orbital_position_deg,
+                    obs.limb_separation_deg,
+                    max_search_orbits=3,  # Search up to 3 orbits ahead
+                    position_tolerance_deg=obs.max_orbital_drift_deg,
+                )
+
+                # Verify Sun constraints
+                if (
+                    not result.pointing_in_antisolar
+                    or result.sun_angle_deg < 91.0
+                ):
+                    logger.warning(
+                        f"    Sun constraint violated (angle={result.sun_angle_deg:.1f}°), skipping"
+                    )
+                    continue
+
+                # Calculate schedule times
+                schedule_time = result.time
+                duration_minutes = (
+                    obs.calculated_duration_minutes or obs.duration
+                )
+                end_obs_time = schedule_time + duration_minutes * u.min
+
+                # Check if we've exceeded the time window
+                if end_obs_time.datetime > end_time.datetime:
+                    logger.warning(
+                        f"    Observation {obs.obs_id} would extend beyond end time, stopping block"
+                    )
+                    break
+
+                # Check orbital drift
+                sc_end = self.ephemeris.get_spacecraft_state(end_obs_time)
+                pos_end = self.earthshine_calc._get_orbital_position(sc_end)
+                drift = abs(pos_end - result.orbital_position_deg)
+                if drift > 180:
+                    drift = 360 - drift
+
+                if drift > obs.max_orbital_drift_deg:
+                    logger.warning(
+                        f"    Orbital drift {drift:.1f}° exceeds max {obs.max_orbital_drift_deg}° "
+                        f"(scheduling anyway)"
+                    )
+
+                # Create sequence
+                sequence = self._create_earthshine_sequence(
+                    obs, schedule_time, end_obs_time, result
+                )
+                scheduled.append(sequence)
+
+                logger.info(
+                    f"    ✓ Scheduled at {schedule_time.iso}, "
+                    f"RA={result.ra_deg:.2f}°, Dec={result.dec_deg:.2f}°"
+                )
+
+                # Update current time for next observation
+                current_time = (
+                    end_obs_time  # + self.config.slew_overhead_minutes * u.min
+                )
+
+            except Exception as e:
+                logger.error(f"    Error scheduling {obs.obs_id}: {e}")
+                continue
+
+        return scheduled
+
+    def _create_earthshine_sequence(
+        self,
+        obs: Observation,
+        start_time: Time,
+        end_time: Time,
+        pointing_result: EarthshineResult,
+    ) -> ObservationSequence:
+        """
+        Create ObservationSequence for an Earthshine observation.
+
+        Args:
+            obs: Source Observation
+            start_time: Sequence start time
+            end_time: Sequence end time
+            pointing_result: Calculated pointing from EarthshinePointing
+
+        Returns:
+            ObservationSequence object
+        """
+        from .models import ObservationSequence
+
+        sequence = ObservationSequence(
+            obs_id=obs.obs_id,
+            sequence_id="000",
+            start=start_time.datetime,
+            stop=end_time.datetime,
+            parent_observation=obs,
+            # Override pointing with calculated values
+            boresight_ra=pointing_result.ra_deg,
+            boresight_dec=pointing_result.dec_deg,
+            target_name=obs.target_name,
+            priority=obs.priority,
+            # Duration breakdown
+            science_duration_minutes=obs.calculated_duration_minutes,
+            nir_duration_minutes=obs.nir_duration,
+            vis_duration_minutes=obs.visible_duration,
+            raw_xml_tree=obs.raw_xml_tree,
         )
 
         return sequence

@@ -236,6 +236,55 @@ class Scheduler:
                     f"Moonshine: scheduled {len(moonshine_sequences)}, unscheduled {len(still_unscheduled)}"
                 )
 
+        # Step 5.6: Schedule Earthshine block if in block mode (NEW)
+        if (
+            self.earthshine_scheduler
+            and self.config.earthshine_config.scheduling_mode == "block"
+        ):
+            earthshine_obs = [
+                o for o in observations if getattr(o, "is_earthshine", False)
+            ]
+            unscheduled_earthshine = [
+                o for o in earthshine_obs if o in unscheduled
+            ]
+
+            if unscheduled_earthshine:
+                logger.info(
+                    f"\n[STEP 5.6/7] Scheduling {len(unscheduled_earthshine)} "
+                    f"Earthshine observations in block mode..."
+                )
+
+                earthshine_sequences, still_unscheduled = (
+                    self.earthshine_scheduler.schedule_block(
+                        unscheduled_earthshine,
+                        Time(self.config.commissioning_start),
+                        Time(self.config.commissioning_end),
+                        self.scheduled_sequences,
+                    )
+                )
+
+                # Add scheduled sequences
+                self.scheduled_sequences.extend(earthshine_sequences)
+
+                # Update unscheduled list
+                scheduled_ids = {seq.obs_id for seq in earthshine_sequences}
+                unscheduled = [
+                    o
+                    for o in unscheduled
+                    if not (
+                        getattr(o, "is_earthshine", False)
+                        and o.obs_id in scheduled_ids
+                    )
+                ]
+                unscheduled.extend(still_unscheduled)
+
+                logger.info(
+                    f"Earthshine block: scheduled {len(earthshine_sequences)}, "
+                    f"unscheduled {len(still_unscheduled)}"
+                )
+        else:
+            logger.info("Earthshine using flexible scheduling mode")
+
         # Step 6: Fill gaps with CVZ pointings
         logger.info("\n[STEP 6/7] Filling gaps with CVZ idle pointings...")
         self._fill_cvz_gaps()
@@ -678,7 +727,19 @@ class Scheduler:
 
         # Special handling for Earthshine observations
         if getattr(obs, "is_earthshine", False):
-            return self._schedule_earthshine_observation(obs)
+            # Only schedule in flexible mode here
+            # Block mode is handled separately in Step 5.6
+            if (
+                self.config.earthshine_config
+                and self.config.earthshine_config.scheduling_mode == "block"
+            ):
+                logger.debug(
+                    f"    Earthshine {obs.obs_id} deferred to block scheduling"
+                )
+                return False  # Will be handled in Step 5.6
+            else:
+                # Flexible mode - schedule now
+                return self._schedule_earthshine_observation(obs)
 
         # Special handling for task 0312_000
         if Task0312Handler.is_task_0312(obs):
@@ -2140,7 +2201,7 @@ class Scheduler:
             try:
                 from .shine_scheduler import (
                     ShineObservationGenerator,
-                    # EarthshineScheduler,
+                    EarthshineScheduler,
                 )
 
                 if not self.shine_generator:
@@ -2148,8 +2209,11 @@ class Scheduler:
                         self.config, shine_ephemeris
                     )
 
-                # EarthshineScheduler will be implemented in next phase
-                # self.earthshine_scheduler = EarthshineScheduler(...)
+                # Create EarthshineScheduler
+                self.earthshine_scheduler = EarthshineScheduler(
+                    self.config, shine_ephemeris, scheduler_ref=self
+                )
+
                 logger.info("✓ Earthshine scheduling enabled")
             except ImportError as e:
                 logger.warning(
@@ -2182,7 +2246,6 @@ class Scheduler:
 
         if task_id and task_id in self.dependencies:
             prereqs = self.dependencies[task_id]
-            print(prereqs)
             missing_prereqs = [
                 p for p in prereqs if p not in self.completed_tasks
             ]
