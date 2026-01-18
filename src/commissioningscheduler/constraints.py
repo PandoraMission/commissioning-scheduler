@@ -145,6 +145,11 @@ class ConstraintChecker:
         # Load Earthshine config
         if "earthshine" in data:
             es_data = data["earthshine"]
+
+            # Load combination filters
+            combinations = es_data.get("combinations", None)
+            exclude_combinations = es_data.get("exclude_combinations", None)
+
             self.config.earthshine_config = EarthshineConfig(
                 enabled=es_data.get("enabled", False),
                 orbital_positions=es_data.get(
@@ -158,11 +163,28 @@ class ConstraintChecker:
                 ),
                 scheduling_mode=es_data.get("scheduling_mode", "flexible"),
                 block_priority=es_data.get("block_priority", "medium"),
+                combinations=combinations,
+                exclude_combinations=exclude_combinations,
             )
-            logger.info(
-                f"Earthshine enabled: {len(es_data.get('orbital_positions', []))} positions, "
-                f"{len(es_data.get('limb_separations', []))} separations"
-            )
+            # Log configuration details
+            if combinations:
+                logger.info(
+                    f"Earthshine enabled (whitelist mode): {len(combinations)} specific combinations"
+                )
+            elif exclude_combinations:
+                n_total = len(es_data.get("orbital_positions", [])) * len(
+                    es_data.get("limb_separations", [])
+                )
+                n_excluded = len(exclude_combinations)
+                logger.info(
+                    f"Earthshine enabled (blacklist mode): {n_total - n_excluded} combinations "
+                    f"({n_excluded} excluded)"
+                )
+            else:
+                logger.info(
+                    f"Earthshine enabled: {len(es_data.get('orbital_positions', []))} positions, "
+                    f"{len(es_data.get('limb_separations', []))} separations"
+                )
 
         # Load Moonshine config
         if "moonshine" in data:
