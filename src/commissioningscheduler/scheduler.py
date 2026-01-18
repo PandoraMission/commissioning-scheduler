@@ -120,13 +120,13 @@ class Scheduler:
         self._schedule_fixed_blocked_time()
         logger.info("✓ Fixed blocked time scheduled")
 
-        # Step 4.5: Initialize Moonshine/Earthshine now that constraints are loaded
+        # Step 3.5: Initialize Moonshine/Earthshine now that constraints are loaded
         logger.info(
             "\n[STEP 4.5/7] Initializing Moonshine/Earthshine components..."
         )
         self._initialize_shine_components()
 
-        # Step 4.6: Generate Moonshine/Earthshine observations (NEW)
+        # Step 3.6: Generate Moonshine/Earthshine observations (NEW)
         if self.shine_generator:
             moonshine_template = self._find_template_xml(xml_paths, "0342")
             earthshine_template = self._find_template_xml(xml_paths, "0341")
@@ -169,6 +169,17 @@ class Scheduler:
         logger.info("\n[STEP 4/7] Computing visibility windows...")
         self._compute_visibility(observations)
         logger.info("✓ Visibility computation complete")
+
+        # Step 4.5: Compute Earthshine orbital visibility
+        earthshine_obs = [
+            o for o in observations if getattr(o, "is_earthshine", False)
+        ]
+        if earthshine_obs:
+            logger.info(
+                f"\n[STEP 4.5/7] Computing orbital position visibility for {len(earthshine_obs)} Earthshine observations..."
+            )
+            self.vis_calc.compute_earthshine_visibility(earthshine_obs)
+            logger.info("✓ Earthshine orbital visibility computed")
 
         # Debug: Print visibility for 0312_000
         obs_0312 = next(
@@ -646,9 +657,7 @@ class Scheduler:
         prereqs = self.dependencies.get(task_id, [])
         return all(prereq in self.completed_tasks for prereq in prereqs)
 
-    def _schedule_single_observation(
-        self, obs: Observation
-    ) -> bool:  # NEEDS CHANGE
+    def _schedule_single_observation(self, obs: Observation) -> bool:
         """
         Schedule a single observation.
 
@@ -667,6 +676,10 @@ class Scheduler:
                 f"    Requested duration: {obs.duration:.4f} minutes ({obs.duration*60:.1f} seconds)"
             )
 
+        # Special handling for Earthshine observations
+        if getattr(obs, "is_earthshine", False):
+            return self._schedule_earthshine_observation(obs)
+
         # Special handling for task 0312_000
         if Task0312Handler.is_task_0312(obs):
             return self._schedule_task_0312(obs)
@@ -677,8 +690,6 @@ class Scheduler:
                 obs, self.current_time
             )
         )
-
-        # GOOD HERE TO TOP
 
         if not constraint_result.valid:
             logger.warning("    Constraint check failed:")
@@ -717,7 +728,6 @@ class Scheduler:
             f"    Found {len(available_windows)} available visibility windows"
         )
 
-        # GOOD HERE TO BOTTOM
         # Determine if we need overhead for first sequence
         needs_initial_overhead = self._needs_slew_overhead(obs)
         logger.info(f"    Needs overhead: {needs_initial_overhead}")
@@ -2130,7 +2140,7 @@ class Scheduler:
             try:
                 from .shine_scheduler import (
                     ShineObservationGenerator,
-                    EarthshineScheduler,
+                    # EarthshineScheduler,
                 )
 
                 if not self.shine_generator:
@@ -2145,6 +2155,178 @@ class Scheduler:
                 logger.warning(
                     f"Earthshine scheduling requested but shine_scheduler not available: {e}"
                 )
+
+    def _schedule_earthshine_observation(self, obs: Observation) -> bool:
+        """
+        Schedule an Earthshine observation.
+
+        Earthshine observations are orbital-position-dependent and get RA/Dec
+        calculated at schedule time based on spacecraft position.
+
+        Args:
+            obs: Earthshine observation
+
+        Returns:
+            True if successfully scheduled, False otherwise
+        """
+        from astropy.time import Time
+        from datetime import timedelta
+        from .shine_scheduler import EarthshinePointing
+
+        logger.info(f"    Scheduling Earthshine observation {obs.obs_id}")
+        logger.info(f"    Orbital position: {obs.orbital_position_deg}°")
+        logger.info(f"    Limb separation: {obs.limb_separation_deg}°")
+
+        # Check if shine_generator is available
+        if (
+            not hasattr(self, "shine_generator")
+            or self.shine_generator is None
+        ):
+            logger.error(
+                "    Shine generator not initialized, cannot schedule Earthshine"
+            )
+            return False
+
+        # Find next visibility window after current time
+        next_window = None
+        for window_start, window_end in obs.visibility_windows:
+            if window_end > self.current_time:
+                # Found a future window
+                next_window = (
+                    max(
+                        window_start, self.current_time
+                    ),  # Start no earlier than current time
+                    window_end,
+                )
+                break
+
+        if not next_window:
+            logger.warning("    No future orbital position windows available")
+            return False
+
+        window_start, window_end = next_window
+
+        # Check if there's enough time in the window
+        duration_minutes = obs.calculated_duration_minutes or obs.duration
+        available_minutes = (window_end - window_start).total_seconds() / 60.0
+
+        if available_minutes < duration_minutes:
+            logger.warning(
+                f"    Not enough time in window: need {duration_minutes:.1f} min, "
+                f"have {available_minutes:.1f} min"
+            )
+            return False
+
+        # Calculate pointing at window start time
+        try:
+            earthshine_calc = EarthshinePointing(
+                self.shine_generator.ephemeris
+            )
+
+            result = earthshine_calc.calculate_pointing(
+                Time(window_start),
+                obs.orbital_position_deg,
+                obs.limb_separation_deg,
+                max_search_orbits=1,  # Already at the right position
+                position_tolerance_deg=obs.max_orbital_drift_deg,
+            )
+
+            # Verify Sun constraints
+            if not result.pointing_in_antisolar:
+                logger.warning(
+                    f"    Pointing not in antisolar hemisphere "
+                    f"(Sun angle={result.sun_angle_deg:.1f}°)"
+                )
+                return False
+
+            if result.sun_angle_deg < 91.0:
+                logger.warning(
+                    f"    Sun avoidance violated ({result.sun_angle_deg:.1f}° < 91°)"
+                )
+                return False
+
+            # Check orbital drift during observation
+            end_time = window_start + timedelta(minutes=duration_minutes)
+            sc_end = earthshine_calc.ephemeris.get_spacecraft_state(
+                Time(end_time)
+            )
+            pos_end = earthshine_calc._get_orbital_position(sc_end)
+
+            drift = abs(pos_end - result.orbital_position_deg)
+            if drift > 180:
+                drift = 360 - drift
+
+            if drift > obs.max_orbital_drift_deg:
+                logger.warning(
+                    f"    Orbital drift {drift:.1f}° exceeds max {obs.max_orbital_drift_deg}° "
+                    f"(scheduling anyway with warning)"
+                )
+
+            # Create the observation sequence
+            from .models import ObservationSequence
+
+            # Determine sequence number
+            existing_seqs = [
+                s for s in self.scheduled_sequences if s.obs_id == obs.obs_id
+            ]
+            seq_num = len(existing_seqs) + 1
+
+            # Add overhead if needed (first sequence for this observation)
+            needs_overhead = seq_num == 1 and self._needs_slew_overhead(obs)
+            overhead_minutes = (
+                self.config.slew_overhead_minutes if needs_overhead else 0.0
+            )
+
+            total_duration = duration_minutes + overhead_minutes
+            final_end_time = window_start + timedelta(minutes=total_duration)
+
+            sequence = ObservationSequence(
+                obs_id=obs.obs_id,
+                sequence_id=f"{seq_num:03d}",
+                start=window_start,
+                stop=final_end_time,
+                parent_observation=obs,
+                target_name=obs.target_name,
+                boresight_ra=result.ra_deg,  # Calculated RA/Dec
+                boresight_dec=result.dec_deg,
+                priority=obs.priority,
+                science_duration_minutes=duration_minutes,
+                nir_duration_minutes=obs.nir_duration_minutes,
+                vis_duration_minutes=obs.visible_duration_minutes,
+                raw_xml_tree=obs.raw_xml_tree,
+            )
+
+            # Add to schedule
+            self.scheduled_sequences.append(sequence)
+            self.completed_observations.add(obs.obs_id)
+
+            # Update tracking
+            self.current_time = final_end_time
+            self.last_ra = result.ra_deg
+            self.last_dec = result.dec_deg
+
+            logger.info(
+                f"    ✓ Scheduled Earthshine {obs.obs_id} at {window_start.isoformat()}"
+            )
+            logger.info(
+                f"      Orbital pos: {result.orbital_position_deg:.1f}°"
+            )
+            logger.info(
+                f"      RA/Dec: {result.ra_deg:.2f}°, {result.dec_deg:.2f}°"
+            )
+            logger.info(f"      Sun angle: {result.sun_angle_deg:.1f}°")
+            logger.info(
+                f"      Duration: {total_duration:.1f} min (science: {duration_minutes:.1f}, overhead: {overhead_minutes:.1f})"
+            )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"    Error calculating Earthshine pointing: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
 
 
 def print_visibility_windows_for_observation(obs: Observation):
