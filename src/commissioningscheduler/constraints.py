@@ -229,11 +229,20 @@ class ConstraintChecker:
 
         # Check if coordinates are valid
         if obs.boresight_ra is None or obs.boresight_dec is None:
-            result.add_violation(
-                ConstraintViolation.INSUFFICIENT_VISIBILITY,
-                f"Observation {obs.obs_id} missing coordinates",
-            )
-            return result
+            # Skip this check for Earthshine/Moonshine - they get coordinates during special scheduling
+            if getattr(obs, "is_earthshine", False) or getattr(
+                obs, "is_moonshine", False
+            ):
+                # These observations will get coordinates during special scheduling
+                logger.debug(
+                    f"Skipping coordinate check for {obs.obs_id} (Earthshine/Moonshine)"
+                )
+            else:
+                result.add_violation(
+                    ConstraintViolation.INSUFFICIENT_VISIBILITY,
+                    f"Observation {obs.obs_id} missing coordinates",
+                )
+                return result
 
         # Check if visibility windows exist
         if not obs.visibility_windows:
