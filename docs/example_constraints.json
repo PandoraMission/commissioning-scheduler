@@ -8,11 +8,25 @@
   },
   "earthshine": {
         "enabled": true,
-        "orbital_positions": [0, 90, 180, 270],
+        "orbital_positions": [0, 45, 90, 135, 180, 225, 270, 315],
         "limb_separations": [5, 10, 15, 20],
         "max_orbital_drift_deg": 30.0,
         "scheduling_mode": "flexible",
-        "block_priority": "medium"
+        "block_priority": "medium",
+        "combinations": [
+        {"orbital_position": 0, "limb_separation": 10},
+        {"orbital_position": 0, "limb_separation": 20},
+        {"orbital_position": 45, "limb_separation": 15},
+        {"orbital_position": 90, "limb_separation": 10},
+        {"orbital_position": 90, "limb_separation": 20},
+        {"orbital_position": 135, "limb_separation": 15},
+        {"orbital_position": 180, "limb_separation": 10},
+        {"orbital_position": 180, "limb_separation": 20},
+        {"orbital_position": 225, "limb_separation": 15},
+        {"orbital_position": 270, "limb_separation": 10},
+        {"orbital_position": 270, "limb_separation": 20},
+        {"orbital_position": 315, "limb_separation": 15}
+        ]
     },
     "moonshine": {
         "enabled": true,
@@ -29,7 +43,7 @@
         {"angular_position": 45, "limb_separation": 15},
         {"angular_position": 90, "limb_separation": 10}
         ]
-      },
+    },
   "blocked_time": [
     {
       "type": "after_task",
