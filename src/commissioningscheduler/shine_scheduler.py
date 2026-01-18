@@ -185,7 +185,7 @@ class ShineObservationGenerator:
         # Generate observations for all combinations
         observations = []
         es_config = self.config.earthshine_config
-        sequence_num = 1
+        sequence_num = 0
 
         for orbital_pos in es_config.orbital_positions:
             for limb_sep in es_config.limb_separations:
