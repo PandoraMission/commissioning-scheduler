@@ -2214,6 +2214,7 @@ class Scheduler:
                     ),  # Start no earlier than current time
                     window_end,
                 )
+                break
 
         if not next_window:
             logger.warning("    No future orbital position windows available")
