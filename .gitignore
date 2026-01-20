@@ -19,6 +19,7 @@ src/commissioningscheduler/*test*.py
 src/commissioningscheduler/test*.xml
 docs/test_shine.py
 old/
+docs/working_xmls
 
 # Mac things
 .DS_Store
