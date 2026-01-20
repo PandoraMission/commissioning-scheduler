@@ -14,7 +14,7 @@ import hashlib
 import pickle
 import logging
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict, Any, Sequence
+from typing import List, Tuple, Optional, Dict, Any, Sequence, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -469,8 +469,14 @@ class VisibilityCalculator:
         return cvz_pointings
 
     def compute_visibility_for_window(
-        self, ra: float, dec: float, window_start: Time, window_end: Time
-    ) -> bool:
+        self,
+        ra: float,
+        dec: float,
+        window_start: Time,
+        window_end: Time,
+        window_only: bool = False,  # NEW PARAMETER
+        visibility_threshold: float = 1.0,  # NEW: for 100% requirement
+    ) -> Union[bool, Tuple[bool, np.ndarray, Time]]:
         """
         Check if a target is visible during a specific time window.
 
@@ -482,53 +488,82 @@ class VisibilityCalculator:
             dec: Declination (degrees)
             window_start: Start of time window
             window_end: End of time window
+            window_only: If True, compute visibility ONLY for this window (faster)
+            visibility_threshold: Fraction of window that must be visible (default 1.0 = 100%)
 
         Returns:
-            True if target is mostly visible during the window
+            If window_only=False: bool (True if visible)
+            If window_only=True: Tuple of (is_visible, visible_bool_array, time_array)
         """
-        # Find indices in our time grid that overlap with the window
-        start_idx = np.searchsorted(self.times.jd, window_start.jd)
-        end_idx = np.searchsorted(self.times.jd, window_end.jd)
-
-        # If window is outside our computed range, compute just for this window
-        if start_idx >= len(self.times) or end_idx == 0:
-            logger.debug(
-                f"Window outside precomputed range, computing visibility for window"
+        if window_only:
+            # Compute visibility ONLY for this specific window - much faster!
+            n_steps = max(
+                3,
+                int(
+                    (window_end - window_start).to_value("sec")
+                    / self.timestep_seconds
+                ),
             )
-            # Create a small time grid just for this window
-            n_steps = int(
-                (window_end - window_start).to_value("sec")
-                / self.timestep_seconds
+            deltas = (
+                np.linspace(
+                    0, (window_end - window_start).to_value("sec"), n_steps
+                )
+                * u.s
             )
-            deltas = np.arange(n_steps) * self.timestep_seconds * u.s
             window_times = window_start + TimeDelta(deltas)
 
             target_coord = SkyCoord(ra=ra, dec=dec, unit="deg", frame="icrs")
             visible_bool = self.vis.get_visibility(target_coord, window_times)
+            visible_bool = np.asarray(visible_bool, dtype=bool)
 
-            # Check if mostly visible (>80%)
             visibility_fraction = np.sum(visible_bool) / len(visible_bool)
-            return visibility_fraction > 0.8
+            is_visible = visibility_fraction >= visibility_threshold
 
-        # Use precomputed times
-        start_idx = max(0, start_idx)
-        end_idx = min(len(self.times), end_idx)
+            return is_visible, visible_bool, window_times
 
-        if end_idx <= start_idx:
-            return False
+        else:
+            # Original behavior - use precomputed full grid
+            start_idx = np.searchsorted(self.times.jd, window_start.jd)
+            end_idx = np.searchsorted(self.times.jd, window_end.jd)
 
-        # Get or compute visibility for this target
-        vis_result = self._compute_for_target(ra, dec, force_recompute=False)
+            if start_idx >= len(self.times) or end_idx == 0:
+                # Window outside precomputed range - compute just for window
+                logger.debug(
+                    "Window outside precomputed range, computing visibility for window"
+                )
+                n_steps = int(
+                    (window_end - window_start).to_value("sec")
+                    / self.timestep_seconds
+                )
+                deltas = np.arange(n_steps) * self.timestep_seconds * u.s
+                window_times = window_start + TimeDelta(deltas)
 
-        # Check visibility in the window
-        window_visible = vis_result.visible_bool[start_idx:end_idx]
+                target_coord = SkyCoord(
+                    ra=ra, dec=dec, unit="deg", frame="icrs"
+                )
+                visible_bool = self.vis.get_visibility(
+                    target_coord, window_times
+                )
 
-        if len(window_visible) == 0:
-            return False
+                visibility_fraction = np.sum(visible_bool) / len(visible_bool)
+                return visibility_fraction >= visibility_threshold
 
-        # Consider visible if >80% of points are visible
-        visibility_fraction = np.sum(window_visible) / len(window_visible)
-        return visibility_fraction > 0.8
+            start_idx = max(0, start_idx)
+            end_idx = min(len(self.times), end_idx)
+
+            if end_idx <= start_idx:
+                return False
+
+            vis_result = self._compute_for_target(
+                ra, dec, force_recompute=False
+            )
+            window_visible = vis_result.visible_bool[start_idx:end_idx]
+
+            if len(window_visible) == 0:
+                return False
+
+            visibility_fraction = np.sum(window_visible) / len(window_visible)
+            return visibility_fraction >= visibility_threshold
 
     def compute_earthshine_visibility(
         self, observations: List[Observation], force_recompute: bool = False
@@ -833,3 +868,577 @@ def get_cache_info(cache_dir: Optional[str] = None) -> Dict[str, Any]:
         "file_count": len(cache_files),
         "total_size_mb": total_size / (1024 * 1024),
     }
+
+
+def find_visible_cvz_pointing_adaptive(
+    calc: VisibilityCalculator,
+    start_time: Time,
+    end_time: Time,
+    initial_dec: float = 8.5,
+    ra_search_range: float = 20.0,
+    ra_step: float = 0.2,
+    min_window_minutes: float = 2.0,
+    skip_visibility_check: bool = False,
+) -> Union[Tuple[float, float], List[Tuple[Time, Time, float, float]]]:
+    """
+    Find visible CVZ pointing(s) using adaptive multi-stage strategy.
+
+    Stages:
+    1. Bidirectional RA search at Dec=8.5
+    2. Intelligent window splitting based on visibility data
+    3. Fallback coordinates (±45° RA, ±45° Dec from CVZ)
+    4. Constraint relaxation (last resort with warnings)
+
+    Args:
+        calc: VisibilityCalculator instance
+        start_time: Start of window
+        end_time: End of window
+        initial_dec: CVZ declination (default: 8.5)
+        ra_search_range: How many degrees to search on each side of antisolar (default: 5.0)
+        ra_step: RA step size for search (default: 0.2)
+        min_window_minutes: Minimum sub-window duration (default: 2.0)
+        skip_visibility_check: If True, return antisolar without checking
+
+    Returns:
+        Either:
+        - Tuple[float, float]: Single (RA, Dec) for entire window
+        - List[Tuple[Time, Time, float, float]]: Multiple (start, end, RA, Dec) sub-windows
+    """
+    midpoint = start_time + (end_time - start_time) / 2
+    antisolar_ra, dec = compute_antisolar_coordinates(midpoint, initial_dec)
+
+    if skip_visibility_check:
+        logger.debug(
+            f"Skipping CVZ visibility check, using antisolar RA={antisolar_ra:.2f}"
+        )
+        return antisolar_ra, dec
+
+    window_duration_minutes = (end_time - start_time).to_value("min")
+    logger.info(
+        f"Finding CVZ pointing for {window_duration_minutes:.1f} min window "
+        f"(antisolar RA={antisolar_ra:.2f}, Dec={dec:.2f})"
+    )
+
+    # ========================================================================
+    # STAGE 1: Bidirectional RA search at Dec=8.5
+    # ========================================================================
+    logger.debug("Stage 1: Bidirectional RA search at CVZ Dec")
+    result = _bidirectional_ra_search(
+        calc, start_time, end_time, antisolar_ra, dec, ra_search_range, ra_step
+    )
+
+    if result is not None:
+        ra_found, dec_found = result
+        logger.info(
+            f"✓ Found single CVZ pointing: RA={ra_found:.2f}, Dec={dec_found:.2f} "
+            f"(offset {((ra_found - antisolar_ra + 180) % 360 - 180):.1f}° from antisolar)"
+        )
+        return ra_found, dec_found
+
+    logger.info("Stage 1 failed: No single CVZ pointing covers entire window")
+
+    # ========================================================================
+    # STAGE 2: Intelligent window splitting
+    # ========================================================================
+    logger.info("Stage 2: Attempting intelligent window splitting...")
+    split_result = _split_window_with_cvz(
+        calc,
+        start_time,
+        end_time,
+        antisolar_ra,
+        dec,
+        ra_search_range,
+        ra_step,
+        min_window_minutes,
+    )
+
+    if split_result is not None:
+        logger.info(
+            f"✓ Successfully split window into {len(split_result)} sub-windows:"
+        )
+        for i, (t_start, t_end, ra, dec_val) in enumerate(split_result, 1):
+            duration = (t_end - t_start).to_value("min")
+            logger.info(
+                f"  Sub-window {i}: {t_start.iso} to {t_end.iso} ({duration:.1f} min) "
+                f"-> RA={ra:.2f}, Dec={dec_val:.2f}"
+            )
+        return split_result
+
+    logger.warning(
+        "Stage 2 failed: Could not split window with CVZ coordinates"
+    )
+
+    # ========================================================================
+    # STAGE 3: Fallback coordinates
+    # ========================================================================
+    logger.warning("Stage 3: Trying fallback coordinates (far from CVZ)...")
+    fallback_result = _try_fallback_coordinates_with_splitting(
+        calc,
+        start_time,
+        end_time,
+        antisolar_ra,
+        initial_dec,
+        min_window_minutes,
+    )
+
+    if fallback_result is not None:
+        if isinstance(fallback_result, tuple) and len(fallback_result) == 2:
+            # Single pointing worked
+            logger.warning(
+                f"✓ Fallback coordinate covers window: RA={fallback_result[0]:.2f}, "
+                f"Dec={fallback_result[1]:.2f}"
+            )
+        else:
+            # Multiple sub-windows
+            logger.warning(
+                f"✓ Fallback coordinates split into {len(fallback_result)} sub-windows"
+            )
+        return fallback_result
+
+    logger.error("Stage 3 failed: Even fallback coordinates don't work!")
+
+    # ========================================================================
+    # STAGE 4: Constraint relaxation (LAST RESORT)
+    # ========================================================================
+    logger.error("=" * 80)
+    logger.error(
+        "⚠️  CONSTRAINT RELAXATION REQUIRED - SCHEDULE MAY BE INVALID  ⚠️"
+    )
+    logger.error("=" * 80)
+    logger.error(f"Window: {start_time.iso} to {end_time.iso}")
+    logger.error("No valid pointing found with standard constraints.")
+    logger.error("Attempting progressive constraint relaxation...")
+
+    relaxed_result = _find_with_relaxed_constraints(
+        calc, start_time, end_time, antisolar_ra, initial_dec
+    )
+
+    logger.error("=" * 80)
+    logger.error(
+        f"⚠️  USING RELAXED CONSTRAINTS: RA={relaxed_result[0]:.2f}, "
+        f"Dec={relaxed_result[1]:.2f}  ⚠️"
+    )
+    logger.error("=" * 80)
+
+    return relaxed_result
+
+
+def _bidirectional_ra_search(
+    calc: VisibilityCalculator,
+    start_time: Time,
+    end_time: Time,
+    antisolar_ra: float,
+    dec: float,
+    search_range: float,
+    ra_step: float,
+) -> Optional[Tuple[float, float]]:
+    """
+    Search RA bidirectionally from antisolar point.
+
+    Search pattern: antisolar, antisolar+step, antisolar-step, antisolar+2*step, etc.
+    """
+    # Try antisolar first
+    is_visible = calc.compute_visibility_for_window(
+        antisolar_ra,
+        dec,
+        start_time,
+        end_time,
+        window_only=True,
+        visibility_threshold=1.0,
+    )[0]
+
+    if is_visible:
+        return antisolar_ra, dec
+
+    # Bidirectional search
+    n_steps = int(search_range / ra_step)
+
+    for i in range(1, n_steps + 1):
+        # Try positive offset
+        test_ra_pos = (antisolar_ra + i * ra_step) % 360.0
+        is_visible = calc.compute_visibility_for_window(
+            test_ra_pos,
+            dec,
+            start_time,
+            end_time,
+            window_only=True,
+            visibility_threshold=1.0,
+        )[0]
+
+        if is_visible:
+            return test_ra_pos, dec
+
+        # Try negative offset
+        test_ra_neg = (antisolar_ra - i * ra_step) % 360.0
+        is_visible = calc.compute_visibility_for_window(
+            test_ra_neg,
+            dec,
+            start_time,
+            end_time,
+            window_only=True,
+            visibility_threshold=1.0,
+        )[0]
+
+        if is_visible:
+            return test_ra_neg, dec
+
+    return None
+
+
+def _split_window_with_cvz(
+    calc: VisibilityCalculator,
+    start_time: Time,
+    end_time: Time,
+    antisolar_ra: float,
+    dec: float,
+    ra_search_range: float,
+    ra_step: float,
+    min_window_minutes: float,
+) -> Optional[List[Tuple[Time, Time, float, float]]]:
+    """
+    Intelligently split window based on visibility data from RA search.
+
+    Strategy:
+    1. Test all RAs in search range, get detailed visibility for each
+    2. Find RA with longest visibility that overlaps window start
+    3. Split window there, use that RA for first sub-window
+    4. Recursively find pointing for remaining sub-window
+    """
+    # Collect visibility data for all tested RAs
+    ra_visibility_data = []
+
+    n_steps = int(ra_search_range / ra_step)
+    test_ras = []
+
+    # Build list of RAs to test (bidirectional)
+    test_ras.append(antisolar_ra)
+    for i in range(1, n_steps + 1):
+        test_ras.append((antisolar_ra + i * ra_step) % 360.0)
+        test_ras.append((antisolar_ra - i * ra_step) % 360.0)
+
+    logger.debug(f"  Analyzing visibility for {len(test_ras)} RA values...")
+
+    for test_ra in test_ras:
+        is_visible, visible_bool, times = calc.compute_visibility_for_window(
+            test_ra,
+            dec,
+            start_time,
+            end_time,
+            window_only=True,
+            visibility_threshold=1.0,
+        )
+
+        if is_visible:
+            # Found full coverage!
+            return None  # Signal caller to use this as single pointing
+
+        ra_visibility_data.append(
+            {
+                "ra": test_ra,
+                "visible_bool": visible_bool,
+                "times": times,
+            }
+        )
+
+    # Find best RA for covering window start
+    best_ra_data = None
+    longest_start_coverage = 0
+
+    for data in ra_visibility_data:
+        if not data["visible_bool"][0]:
+            # Doesn't cover window start
+            continue
+
+        # Find how long it stays visible from start
+        visible_duration = 0
+        for i, vis in enumerate(data["visible_bool"]):
+            if not vis:
+                break
+            visible_duration = (data["times"][i] - start_time).to_value("min")
+
+        if visible_duration > longest_start_coverage:
+            longest_start_coverage = visible_duration
+            best_ra_data = data
+
+    if best_ra_data is None or longest_start_coverage < min_window_minutes:
+        logger.debug(
+            "  Cannot find RA covering window start for minimum duration"
+        )
+        return None
+
+    # Split window at end of best RA's visibility
+    split_time = None
+    for i, vis in enumerate(best_ra_data["visible_bool"]):
+        if not vis:
+            split_time = best_ra_data["times"][i - 1] if i > 0 else start_time
+            break
+
+    if split_time is None:
+        split_time = end_time
+
+    # Create first sub-window
+    sub_windows = [(start_time, split_time, best_ra_data["ra"], dec)]
+
+    logger.debug(
+        f"  First sub-window: {start_time.iso} to {split_time.iso}, "
+        f"RA={best_ra_data['ra']:.2f} ({longest_start_coverage:.1f} min)"
+    )
+
+    # Remaining time
+    remaining_duration = (end_time - split_time).to_value("min")
+
+    if remaining_duration < min_window_minutes:
+        # Done!
+        return sub_windows
+
+    # Try to fill remaining time
+    logger.debug(
+        f"  Remaining time: {remaining_duration:.1f} min, searching for second pointing..."
+    )
+
+    # Try bidirectional search for remaining window
+    second_pointing = _bidirectional_ra_search(
+        calc, split_time, end_time, antisolar_ra, dec, ra_search_range, ra_step
+    )
+
+    if second_pointing is not None:
+        sub_windows.append(
+            (split_time, end_time, second_pointing[0], second_pointing[1])
+        )
+        logger.debug(f"  Second sub-window: RA={second_pointing[0]:.2f}")
+        return sub_windows
+
+    # Second pointing not found with CVZ - return None to trigger fallback stage
+    logger.debug("  Could not find second CVZ pointing for remaining time")
+    return None
+
+
+def _try_fallback_coordinates_with_splitting(
+    calc: VisibilityCalculator,
+    start_time: Time,
+    end_time: Time,
+    antisolar_ra: float,
+    cvz_dec: float,
+    min_window_minutes: float,
+) -> Optional[
+    Union[Tuple[float, float], List[Tuple[Time, Time, float, float]]]
+]:
+    """
+    Try 4 fallback coordinates, with intelligent splitting if needed.
+
+    Fallback coordinates (far from CVZ):
+    1. (antisolar_ra - 45°, cvz_dec)
+    2. (antisolar_ra + 45°, cvz_dec)
+    3. (antisolar_ra, +53.5°)
+    4. (antisolar_ra, -36.5°)
+    """
+    fallback_coords = [
+        ((antisolar_ra - 45.0) % 360.0, cvz_dec, "RA-45°"),
+        ((antisolar_ra + 45.0) % 360.0, cvz_dec, "RA+45°"),
+        (antisolar_ra, 53.5, "Dec+45°"),
+        (antisolar_ra, -36.5, "Dec-45°"),
+    ]
+
+    # First try: Can any single fallback cover entire window?
+    for ra, dec, label in fallback_coords:
+        is_visible = calc.compute_visibility_for_window(
+            ra,
+            dec,
+            start_time,
+            end_time,
+            window_only=True,
+            visibility_threshold=1.0,
+        )[0]
+
+        if is_visible:
+            logger.info(
+                f"  Fallback {label} covers entire window: RA={ra:.2f}, Dec={dec:.2f}"
+            )
+            return ra, dec
+
+    # Second try: Can we split using fallback coordinates?
+    logger.debug("  Single fallback failed, trying to split with fallbacks...")
+
+    # Collect visibility data for all fallbacks
+    fallback_visibility = []
+    for ra, dec, label in fallback_coords:
+        is_visible, visible_bool, times = calc.compute_visibility_for_window(
+            ra,
+            dec,
+            start_time,
+            end_time,
+            window_only=True,
+            visibility_threshold=1.0,
+        )
+        fallback_visibility.append(
+            {
+                "ra": ra,
+                "dec": dec,
+                "label": label,
+                "visible_bool": visible_bool,
+                "times": times,
+            }
+        )
+
+    # Find best coverage for window start
+    best_start = None
+    longest_start = 0
+
+    for data in fallback_visibility:
+        if not data["visible_bool"][0]:
+            continue
+
+        duration = 0
+        for i, vis in enumerate(data["visible_bool"]):
+            if not vis:
+                break
+            duration = (data["times"][i] - start_time).to_value("min")
+
+        if duration > longest_start and duration >= min_window_minutes:
+            longest_start = duration
+            best_start = data
+
+    if best_start is None:
+        return None
+
+    # Split at end of best start coverage
+    split_time = None
+    for i, vis in enumerate(best_start["visible_bool"]):
+        if not vis:
+            split_time = best_start["times"][i - 1] if i > 0 else start_time
+            break
+
+    if split_time is None:
+        split_time = end_time
+
+    sub_windows = [
+        (start_time, split_time, best_start["ra"], best_start["dec"])
+    ]
+
+    remaining = (end_time - split_time).to_value("min")
+    if remaining < min_window_minutes:
+        return sub_windows
+
+    # Try to cover remaining with another fallback
+    for data in fallback_visibility:
+        is_visible = calc.compute_visibility_for_window(
+            data["ra"],
+            data["dec"],
+            split_time,
+            end_time,
+            window_only=True,
+            visibility_threshold=1.0,
+        )[0]
+
+        if is_visible:
+            sub_windows.append((split_time, end_time, data["ra"], data["dec"]))
+            logger.info(
+                f"  Split using fallbacks: {best_start['label']} + {data['label']}"
+            )
+            return sub_windows
+
+    return None
+
+
+def _find_with_relaxed_constraints(
+    calc: VisibilityCalculator,
+    start_time: Time,
+    end_time: Time,
+    antisolar_ra: float,
+    dec: float,
+) -> Tuple[float, float]:
+    """
+    Last resort: progressively relax constraints until valid pointing found.
+
+    Relaxation order:
+    1. Moon: 25° → 20° → 15° → 10° → 5°
+    2. Earth limb: 20° → 15° → 10° → 5°
+    3. If still failing, return antisolar (should never happen)
+    """
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+
+    # Save original constraints
+    original_moon = calc.vis.moon_min
+    original_earth = calc.vis.earthlimb_min
+
+    # Try progressively relaxed constraints
+    moon_limits = [20, 15, 10, 5] * u.deg
+    earth_limits = [15, 10, 5] * u.deg
+
+    try:
+        # Try relaxing Moon first
+        for moon_limit in moon_limits:
+            calc.vis.moon_min = moon_limit
+            logger.error(f"  Trying Moon limit: {moon_limit}")
+
+            is_visible = calc.compute_visibility_for_window(
+                antisolar_ra,
+                dec,
+                start_time,
+                end_time,
+                window_only=True,
+                visibility_threshold=1.0,
+            )[0]
+
+            if is_visible:
+                logger.error(
+                    f"  ✓ Success with Moon={moon_limit}, Earth={original_earth}"
+                )
+                return antisolar_ra, dec
+
+        # Try relaxing Earth limb
+        calc.vis.moon_min = original_moon  # Reset Moon
+        for earth_limit in earth_limits:
+            calc.vis.earthlimb_min = earth_limit
+            logger.error(f"  Trying Earth limb: {earth_limit}")
+
+            is_visible = calc.compute_visibility_for_window(
+                antisolar_ra,
+                dec,
+                start_time,
+                end_time,
+                window_only=True,
+                visibility_threshold=1.0,
+            )[0]
+
+            if is_visible:
+                logger.error(
+                    f"  ✓ Success with Moon={original_moon}, Earth={earth_limit}"
+                )
+                return antisolar_ra, dec
+
+        # Try both relaxed
+        for moon_limit in moon_limits:
+            for earth_limit in earth_limits:
+                calc.vis.moon_min = moon_limit
+                calc.vis.earthlimb_min = earth_limit
+                logger.error(
+                    f"  Trying Moon={moon_limit}, Earth={earth_limit}"
+                )
+
+                is_visible = calc.compute_visibility_for_window(
+                    antisolar_ra,
+                    dec,
+                    start_time,
+                    end_time,
+                    window_only=True,
+                    visibility_threshold=1.0,
+                )[0]
+
+                if is_visible:
+                    logger.error(
+                        f"  ✓ Success with Moon={moon_limit}, Earth={earth_limit}"
+                    )
+                    return antisolar_ra, dec
+
+    finally:
+        # Always restore original constraints
+        calc.vis.moon_min = original_moon
+        calc.vis.earthlimb_min = original_earth
+
+    # Absolute fallback - should never reach here
+    logger.error(
+        "  ⚠️  EXTREME FALLBACK: Using antisolar despite constraints ⚠️"
+    )
+    return antisolar_ra, dec

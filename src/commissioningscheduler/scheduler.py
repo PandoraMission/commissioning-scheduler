@@ -34,6 +34,7 @@ from .visibility import (
     VisibilityCalculator,
     find_visible_cvz_pointing,
     compute_antisolar_coordinates,
+    find_visible_cvz_pointing_adaptive,
 )
 from .constraints import (
     ConstraintChecker,
@@ -1178,6 +1179,8 @@ class Scheduler:
             gaps = self._try_fill_gaps_with_science(gaps)
 
         # Fill blocked time windows with CVZ sequences
+        print(self.blocked_time_windows)
+        # blah
         if self.blocked_time_windows:
             logger.info(
                 f"Filling {len(self.blocked_time_windows)} blocked time windows with CVZ sequences..."
@@ -1475,60 +1478,113 @@ class Scheduler:
         for gap_idx, (gap_start, gap_end) in enumerate(gaps):
             gap_duration = (gap_end - gap_start).total_seconds() / 60.0
 
-            # Find CVZ pointing
-            midpoint = gap_start + (gap_end - gap_start) / 2
-            antisolar_ra, dec = compute_antisolar_coordinates(
-                Time(midpoint), self.config.cvz_coords[1]
+            logger.info(
+                f"  Gap {gap_idx + 1}: {gap_start} to {gap_end} ({gap_duration:.1f} min)"
             )
 
             if skip_visibility:
+                # Simple case - no visibility check
+                midpoint = gap_start + (gap_end - gap_start) / 2
+                antisolar_ra, dec = compute_antisolar_coordinates(
+                    Time(midpoint), self.config.cvz_coords[1]
+                )
                 ra, dec = antisolar_ra, dec
+
+                cvz_chunks = self._split_cvz_gap(gap_start, gap_end)
+
+                for chunk_idx, (chunk_start, chunk_end) in enumerate(
+                    cvz_chunks, 1
+                ):
+                    chunk_duration = (
+                        chunk_end - chunk_start
+                    ).total_seconds() / 60.0
+
+                    seq = ObservationSequence(
+                        obs_id="CVZ",
+                        sequence_id=f"{chunk_idx:03d}",
+                        start=chunk_start,
+                        stop=chunk_end,
+                        target_name="CVZ",
+                        boresight_ra=ra,
+                        boresight_dec=dec,
+                        priority=0,
+                        science_duration_minutes=chunk_duration,
+                    )
+                    seq.metadata["needs_vis_block"] = True
+                    self.scheduled_sequences.append(seq)
+
             else:
-                coords = find_visible_cvz_pointing(
+                # Use adaptive CVZ finder
+                result = find_visible_cvz_pointing_adaptive(
                     self.vis_calc,
                     Time(gap_start),
                     Time(gap_end),
                     self.config.cvz_coords[1],
                     skip_visibility_check=False,
                 )
-                if coords:
-                    ra, dec = coords
+
+                # Check if result is single pointing or split windows
+                if isinstance(result, tuple) and len(result) == 2:
+                    # Single pointing for entire gap
+                    ra, dec = result
+                    logger.info(
+                        f"    Single CVZ pointing: RA={ra:.2f}, Dec={dec:.2f}"
+                    )
+
+                    cvz_chunks = self._split_cvz_gap(gap_start, gap_end)
+
+                    for chunk_idx, (chunk_start, chunk_end) in enumerate(
+                        cvz_chunks, 1
+                    ):
+                        chunk_duration = (
+                            chunk_end - chunk_start
+                        ).total_seconds() / 60.0
+
+                        seq = ObservationSequence(
+                            obs_id="CVZ",
+                            sequence_id=f"{chunk_idx:03d}",
+                            start=chunk_start,
+                            stop=chunk_end,
+                            target_name="CVZ",
+                            boresight_ra=ra,
+                            boresight_dec=dec,
+                            priority=0,
+                            science_duration_minutes=chunk_duration,
+                        )
+                        seq.metadata["needs_vis_block"] = True
+                        self.scheduled_sequences.append(seq)
+
                 else:
-                    ra, dec = antisolar_ra, dec
+                    # Multiple sub-windows with different pointings
+                    logger.info(
+                        f"    Split into {len(result)} sub-windows with different pointings"
+                    )
 
-            # Split into chunks
-            cvz_chunks = self._split_cvz_gap(gap_start, gap_end)
+                    for subwin_idx, (sub_start, sub_end, ra, dec) in enumerate(
+                        result, 1
+                    ):
+                        sub_duration = (sub_end - sub_start).to_value("min")
 
-            logger.info(
-                f"  Gap {gap_idx + 1}: {gap_start} to {gap_end} ({gap_duration:.1f} min)"
-            )
-            logger.info(
-                f"    CVZ pointing at RA={ra:.2f}, DEC={dec:.2f}, {len(cvz_chunks)} chunk(s)"
-            )
+                        logger.info(
+                            f"      Sub-window {subwin_idx}: RA={ra:.2f}, Dec={dec:.2f} "
+                            f"({sub_duration:.1f} min)"
+                        )
 
-            for chunk_idx, (chunk_start, chunk_end) in enumerate(
-                cvz_chunks, 1
-            ):
-                chunk_duration = (
-                    chunk_end - chunk_start
-                ).total_seconds() / 60.0
-
-                seq = ObservationSequence(
-                    obs_id="CVZ",
-                    sequence_id=f"{chunk_idx:03d}",
-                    start=chunk_start,
-                    stop=chunk_end,
-                    target_name="CVZ",
-                    boresight_ra=ra,
-                    boresight_dec=dec,
-                    priority=0,
-                    science_duration_minutes=chunk_duration,
-                )
-
-                seq.metadata["needs_vis_block"] = True
-
-                # Add to flat sequence list
-                self.scheduled_sequences.append(seq)
+                        # Each sub-window becomes its own sequence (no further 90-min chunking)
+                        seq = ObservationSequence(
+                            obs_id="CVZ",
+                            sequence_id=f"{subwin_idx:03d}",
+                            start=sub_start.datetime,
+                            stop=sub_end.datetime,
+                            target_name="CVZ",
+                            boresight_ra=ra,
+                            boresight_dec=dec,
+                            priority=0,
+                            science_duration_minutes=sub_duration,
+                        )
+                        seq.metadata["needs_vis_block"] = True
+                        seq.metadata["is_split_cvz"] = True
+                        self.scheduled_sequences.append(seq)
 
                 logger.debug(
                     f"      Added CVZ sequence: {chunk_start} to {chunk_end}"
@@ -1843,19 +1899,21 @@ class Scheduler:
         for blocked_idx, blocked_window in enumerate(
             self.blocked_time_windows
         ):
+            logger.info(
+                f"  Blocked time {blocked_idx + 1} ({blocked_window.window_type}): "
+                f"{blocked_window.start_time} to {blocked_window.end_time}"
+            )
+
+            skip_visibility = not self.config.verify_cvz_visibility
+
             # Split into 90-minute chunks first
             cvz_chunks = self._split_cvz_gap(
                 blocked_window.start_time, blocked_window.end_time
             )
 
             logger.info(
-                f"  Blocked time {blocked_idx + 1} ({blocked_window.window_type}): {blocked_window.start_time} to {blocked_window.end_time}"
+                f"    Processing {len(cvz_chunks)} chunks with adaptive CVZ pointing"
             )
-            logger.info(
-                f"    Creating {len(cvz_chunks)} CVZ sequences with dynamic pointing"
-            )
-
-            skip_visibility = not self.config.verify_cvz_visibility
 
             for chunk_idx, (chunk_start, chunk_end) in enumerate(
                 cvz_chunks, 1
@@ -1863,47 +1921,107 @@ class Scheduler:
                 chunk_duration = (
                     chunk_end - chunk_start
                 ).total_seconds() / 60.0
-
-                # Calculate pointing for THIS chunk (not the whole blocked window)
-                chunk_midpoint = chunk_start + (chunk_end - chunk_start) / 2
-                antisolar_ra, dec = compute_antisolar_coordinates(
-                    Time(chunk_midpoint), self.config.cvz_coords[1]
-                )
+                print(chunk_start)
+                print(chunk_end)
+                # blah
 
                 if skip_visibility:
+                    chunk_midpoint = (
+                        chunk_start + (chunk_end - chunk_start) / 2
+                    )
+                    antisolar_ra, dec = compute_antisolar_coordinates(
+                        Time(chunk_midpoint), self.config.cvz_coords[1]
+                    )
                     ra, dec = antisolar_ra, dec
+
+                    seq = ObservationSequence(
+                        obs_id="CVZ_BLOCKED",
+                        sequence_id=f"{chunk_idx:03d}",
+                        start=chunk_start,
+                        stop=chunk_end,
+                        target_name=f"CVZ_{blocked_window.window_type}",
+                        boresight_ra=ra,
+                        boresight_dec=dec,
+                        priority=0,
+                        science_duration_minutes=chunk_duration,
+                    )
+                    seq.metadata["needs_vis_block"] = True
+                    seq.metadata["blocked_type"] = blocked_window.window_type
+                    seq.metadata["blocked_description"] = (
+                        blocked_window.description
+                    )
+                    self.scheduled_sequences.append(seq)
+
                 else:
-                    coords = find_visible_cvz_pointing(
+                    # Use adaptive CVZ finder for each chunk
+                    result = find_visible_cvz_pointing_adaptive(
                         self.vis_calc,
                         Time(chunk_start),
                         Time(chunk_end),
                         self.config.cvz_coords[1],
                         skip_visibility_check=False,
                     )
-                    if coords:
-                        ra, dec = coords
+
+                    if isinstance(result, tuple) and len(result) == 2:
+                        # Single pointing
+                        ra, dec = result
+
+                        seq = ObservationSequence(
+                            obs_id="CVZ_BLOCKED",
+                            sequence_id=f"{chunk_idx:03d}",
+                            start=chunk_start,
+                            stop=chunk_end,
+                            target_name=f"CVZ_{blocked_window.window_type}",
+                            boresight_ra=ra,
+                            boresight_dec=dec,
+                            priority=0,
+                            science_duration_minutes=chunk_duration,
+                        )
+                        seq.metadata["needs_vis_block"] = True
+                        seq.metadata["blocked_type"] = (
+                            blocked_window.window_type
+                        )
+                        seq.metadata["blocked_description"] = (
+                            blocked_window.description
+                        )
+                        self.scheduled_sequences.append(seq)
+
                     else:
-                        ra, dec = antisolar_ra, dec
+                        # Split pointings
+                        logger.debug(
+                            f"      Chunk {chunk_idx} split into {len(result)} sub-chunks"
+                        )
 
-                seq = ObservationSequence(
-                    obs_id="CVZ_BLOCKED",
-                    sequence_id=f"{chunk_idx:03d}",
-                    start=chunk_start,
-                    stop=chunk_end,
-                    target_name=f"CVZ_{blocked_window.window_type}",
-                    boresight_ra=ra,
-                    boresight_dec=dec,
-                    priority=0,
-                    science_duration_minutes=chunk_duration,
-                )
+                        for sub_idx, (
+                            sub_start,
+                            sub_end,
+                            ra,
+                            dec,
+                        ) in enumerate(result, 1):
+                            sub_duration = (sub_end - sub_start).to_value(
+                                "min"
+                            )
 
-                seq.metadata["needs_vis_block"] = True
-                seq.metadata["blocked_type"] = blocked_window.window_type
-                seq.metadata["blocked_description"] = (
-                    blocked_window.description
-                )
-
-                self.scheduled_sequences.append(seq)
+                            seq = ObservationSequence(
+                                obs_id="CVZ_BLOCKED",
+                                sequence_id=f"{chunk_idx:03d}_{sub_idx:02d}",
+                                start=sub_start.datetime,
+                                stop=sub_end.datetime,
+                                target_name=f"CVZ_{blocked_window.window_type}",
+                                boresight_ra=ra,
+                                boresight_dec=dec,
+                                priority=0,
+                                science_duration_minutes=sub_duration,
+                            )
+                            seq.metadata["needs_vis_block"] = True
+                            seq.metadata["blocked_type"] = (
+                                blocked_window.window_type
+                            )
+                            seq.metadata["blocked_description"] = (
+                                blocked_window.description
+                            )
+                            seq.metadata["is_split_cvz"] = True
+                            self.scheduled_sequences.append(seq)
 
                 logger.debug(
                     f"      Chunk {chunk_idx}: {chunk_start} to {chunk_end}, RA={ra:.2f}"

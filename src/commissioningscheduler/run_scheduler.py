@@ -24,7 +24,8 @@ logging.basicConfig(
 )
 
 # Configuration
-xml_dir = "../../docs/xml_in_v5_01122026/"
+# xml_dir = "../../docs/xml_in_v5_01122026/"
+xml_dir = "../../docs/working_xmls/"
 output_path = "./master_schedule.xml"
 cvz_coords = (120.0, 8.5)
 
@@ -36,8 +37,9 @@ tle2 = "2 99152  97.8003  18.8171 0003829 259.1072 192.9926 14.87777498    09"
 
 
 # Commissioning period
-commissioning_start = datetime(2026, 1, 21, 8, 0)
-commissioning_end = datetime(2026, 2, 11, 0, 0)
+commissioning_start = datetime(2026, 1, 21, 17, 16)
+commissioning_end = datetime(2026, 1, 22, 12, 0)
+# commissioning_end = datetime(2026, 1, 22, 0, 0)
 
 # Run scheduler
 print("\n" + "=" * 80)
@@ -54,7 +56,7 @@ result = schedule_observations(
     cvz_coords=cvz_coords,
     constraints_json="constraints.json",
     max_data_volume_gb=150.0,
-    verify_cvz_visibility=False,  # Set to False for faster debugging
+    verify_cvz_visibility=True,  # Set to False for faster debugging
     enable_gap_filling=True,  # Try to schedule science in gaps
 )
 
