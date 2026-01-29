@@ -31,13 +31,14 @@ cvz_coords = (120.0, 8.5)
 # TLE (Two-Line Element set for satellite orbit)
 # tle1 = "1 99152U 80229J   26014.83069444  .00000000  00000-0  37770-3 0    08"
 # tle2 = "2 99152  97.8005  15.9441 0003693 273.7015  26.6009 14.87738574    04"
-tle1 = "1 99152U 80229J   26017.75114583  .00000000  00000-0  37770-3 0    07"
-tle2 = "2 99152  97.8003  18.8171 0003829 259.1072 192.9926 14.87777498    09"
-
+# tle1 = "1 99152U 80229J   26017.75114583  .00000000  00000-0  37770-3 0    07"
+# tle2 = "2 99152  97.8003  18.8171 0003829 259.1072 192.9926 14.87777498    09"
+tle1 = "1 99152U 80229J   26028.98563657  .00000000  00000-0  37770-3 0    04"
+tle2 = "2 99152  97.7989  29.8614 0004295 213.9017  252.3527 14.87783072   03"
 
 # Commissioning period
-commissioning_start = datetime(2026, 1, 21, 8, 0)
-commissioning_end = datetime(2026, 2, 11, 0, 0)
+commissioning_start = datetime(2026, 1, 30, 8, 0) # UTC
+commissioning_end = datetime(2026, 2, 11, 0, 0) # UTC
 
 # Run scheduler
 print("\n" + "=" * 80)
@@ -52,7 +53,7 @@ result = schedule_observations(
     commissioning_start=commissioning_start,
     commissioning_end=commissioning_end,
     cvz_coords=cvz_coords,
-    constraints_json="constraints.json",
+    constraints_json="constraints_test.json",
     max_data_volume_gb=150.0,
     verify_cvz_visibility=False,  # Set to False for faster debugging
     enable_gap_filling=True,  # Try to schedule science in gaps

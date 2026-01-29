@@ -1,0 +1,101 @@
+{
+    "dependencies": {
+        // "0310": [],
+        // "0312": ["0310"],
+        // "0315": ["0310", "0312"],
+        // "3175": ["0310", "0312", "0315"],
+        // "0318": ["0310", "0312", "0315", "3175"],
+        // "0319": ["0310", "0312", "0315", "3175", "0318"],
+        // "0320": ["0310", "0312", "0315", "3175", "0318", "0319"],
+        // "0321": ["0310", "0312", "0315", "3175", "0318", "0319"],
+        // "0343": ["0310", "0312", "0315", "3175", "0318", "0319"], // Stray light
+        // "0341": ["0310", "0312", "0315", "3175", "0318", "0319"], // Earthshine
+        // "0342": ["0310", "0312", "0315", "3175", "0318", "0319"], // Moonshine
+
+        "0343": [], // Stray light
+        "0341": [], // Earthshine
+        "0342": [], // Moonshine
+
+        // "0350": ["0310", "0312", "0315", "3175", "0318", "0319"],
+        // "0355": ["0310", "0312", "0315", "3175", "0318", "0319"],
+        // "0360": ["0310", "0312", "0315", "3175", "0318", "0319"],
+        // "0330": ["0310", "0312", "0315", "3175", "0318", "0319", "0320", "0321", "0343", "0350", "0355", "0360"],
+        // "0399": ["0310", "0312", "0315", "3175", "0318", "0319", "0320", "0321", "0330", "0343", "0350", "0355", "0360"]
+    },
+    "earthshine": {
+        "enabled": true,
+        "orbital_positions": [0, 45, 90, 135, 180, 225, 270, 315], // May need to adjust these by hand (degrees); 0 is closest to the North Pole, 90 deg is 1/4 orbit later, etc
+        "limb_separations": [5, 10, 15, 20], // May need to adjust these by hand (degrees)
+        "max_orbital_drift_deg": 30.0,
+        "scheduling_mode": "flexible", // every combination below as distinct obs; other option is "block" which is all have to be done together in a block of time
+        "block_priority": "medium",
+        "combinations": [
+        {"orbital_position": 0, "limb_separation": 10}, // May need to adjust these by hand
+        {"orbital_position": 0, "limb_separation": 20}, // May need to adjust these by hand
+        {"orbital_position": 45, "limb_separation": 15}, // May need to adjust these by hand
+        {"orbital_position": 90, "limb_separation": 10}, // May need to adjust these by hand
+        {"orbital_position": 90, "limb_separation": 20}, // May need to adjust these by hand
+        {"orbital_position": 135, "limb_separation": 15}, // May need to adjust these by hand
+        {"orbital_position": 180, "limb_separation": 10}, // May need to adjust these by hand
+        {"orbital_position": 180, "limb_separation": 20}, // May need to adjust these by hand
+        {"orbital_position": 225, "limb_separation": 15}, // May need to adjust these by hand
+        {"orbital_position": 270, "limb_separation": 10}, // May need to adjust these by hand
+        {"orbital_position": 270, "limb_separation": 20}, // May need to adjust these by hand
+        {"orbital_position": 315, "limb_separation": 15} // May need to adjust these by hand
+        ]
+    },
+    "moonshine": {
+        "enabled": true,
+        "target_date": "2026-02-01 00:00:00",
+        "window_days": 1.0,
+        "angular_positions": [0, 45, 90, 135, 180, 225, 270, 315], // May need to adjust these by hand as above for Earthshine
+        "limb_separations": [5, 10, 15, 20],
+        "check_moon_visibility": true,
+        "earth_avoidance_deg": 20.0, // MOC may decide to change this
+        "combinations": [
+        {"angular_position": 0, "limb_separation": 10},
+        {"angular_position": 0, "limb_separation": 20},
+        {"angular_position": 45, "limb_separation": 5},
+        {"angular_position": 45, "limb_separation": 15},
+        {"angular_position": 90, "limb_separation": 10},
+        {"angular_position": 90, "limb_separation": 20},
+        {"angular_position": 135, "limb_separation": 5},
+        {"angular_position": 135, "limb_separation": 15},
+        {"angular_position": 180, "limb_separation": 10},
+        {"angular_position": 180, "limb_separation": 20},
+        {"angular_position": 225, "limb_separation": 5},
+        {"angular_position": 225, "limb_separation": 15},
+        {"angular_position": 270, "limb_separation": 10},
+        {"angular_position": 270, "limb_separation": 20},
+        {"angular_position": 315, "limb_separation": 5},
+        {"angular_position": 315, "limb_separation": 15}
+        ]
+    },
+    "blocked_time": [
+        {
+            "type": "after_task",
+            "task_id": "0312",
+            "duration_minutes": 240,
+            "window_type": "analysis_buffer",
+            "description": "Post-0312 downlink and data analysis buffer"
+        },
+        {
+            "type": "after_task",
+            "task_id": "3175",
+            "duration_minutes": 240,
+            "window_type": "analysis_buffer",
+            "description": "Post-3175 downlink and data analysis buffer"
+        },
+        {
+            "type": "after_task",
+            "task_id": "0319",
+            "duration_minutes": 240,
+            "window_type": "analysis_buffer",
+            "description": "Post-0319 downlink and data analysis buffer"
+        }
+    ],
+    "continuous_observations": {
+        "tasks": ["0318", "0319", "0320", "0330", "0343"],
+        "description": "Must be scheduled as continuous blocks without splitting"
+    } 
+}
